@@ -46,7 +46,6 @@ EVCC already provides:
 - **FR1.2**: Identify low-price periods (noon vs night) with seasonal adaptation
 - **FR1.3**: Calculate peak duration and severity for SoC planning
 - **FR1.4**: Adapt to different tariff providers and price patterns
-- **FR1.5**: Historical pattern learning for improved predictions
 
 #### FR2: Solar-Aware SoC Optimization
 - **FR2.1**: Integrate solar generation forecasts into charging decisions
@@ -64,12 +63,12 @@ EVCC already provides:
 
 #### FR4: Integration with Existing Systems
 - **FR4.1**: Reuse existing tariff providers and rate data
-- **FR4.2**: Coordinate with EV charging plans to avoid conflicts
+- **FR4.2**: Leverage existing site-level coordination with EV charging
 - **FR4.3**: Respect existing battery priority/buffer SoC settings
 - **FR4.4**: Leverage existing solar forecast infrastructure
 
 #### FR5: User Interface and Control
-- **FR5.1**: Direct cost parameter configuration (minSavingsPerKwh, maxChargingPrice)
+- **FR5.1**: Single economic threshold configuration (minSavingsPerKwh)
 - **FR5.2**: Visual display of price patterns and charging decisions
 - **FR5.3**: Real-time optimization status and reasoning
 - **FR5.4**: Simple enable/disable override controls
@@ -103,11 +102,22 @@ EVCC already provides:
 └─────────────────┘    │     (New)        │    │    (New)        │
                        └──────────────────┘    └─────────────────┘
                                 │                        │
+                                │                        ▼
+                                │               ┌─────────────────┐
+                                │               │ Battery Mode    │
+                                │               │ Decision        │
+                                │               │    (New)        │
+                                │               └─────────────────┘
+                                │                        │
                                 ▼                        ▼
                        ┌──────────────────┐    ┌─────────────────┐
-                       │  Solar Forecast  │    │ Battery Control │
-                       │   (Existing)     │    │   (Enhanced)    │
-                       └──────────────────┘    └─────────────────┘
+                       │  Solar Forecast  │    │ Existing Battery│
+                       │   (Existing)     │    │ Control System  │
+                       └──────────────────┘    │   (Existing)    │
+                                │              └─────────────────┘
+                                │                        │
+                                └────────────────────────┘
+                                    Current SoC Reading
 ```
 
 ### Core Components
@@ -116,9 +126,8 @@ EVCC already provides:
 ```go
 // New component: core/analyzer/price_pattern.go
 type PricePatternAnalyzer struct {
-    log            *util.Logger
-    rates          api.Rates
-    historicalData *PriceHistory
+    log   *util.Logger
+    rates api.Rates
 }
 
 type PricePeak struct {
@@ -143,44 +152,51 @@ func (ppa *PricePatternAnalyzer) DetectPeaks(rates api.Rates) []PricePeak
 func (ppa *PricePatternAnalyzer) ClassifySeason(pattern PricePattern) string
 ```
 
-#### 2. Dynamic SoC Configuration
+#### 1.1. Consumption Estimator
 ```go
-// Simplified configuration structure
-type DynamicBatteryConfig struct {
-    Enable            bool    `json:"enable"`
-    AggressivenessLevel string `json:"aggressiveness"` // "conservative", "balanced", "aggressive"
+// Conservative consumption forecasting without complex weather modeling
+type ConsumptionEstimator struct {
+    historicalData []float64  // kWh per day for last 30 days
+    config         ConsumptionConfig
+}
+
+func (ce *ConsumptionEstimator) estimateDailyConsumption() float64 {
+    if len(ce.historicalData) < 7 {
+        // Not enough history, use static fallback
+        consumption := ce.config.StaticFallbackKwh
+        if ce.isWeekend() {
+            consumption *= ce.config.WeekendReduction
+        }
+        return consumption
+    }
     
-    // Peak riding configuration
-    PeakRidingMinSoc     int     `json:"peakRidingMinSoc"`     // Min SoC to ride through any peak (default: 20%)
-    PeakRidingTargetSoc  int     `json:"peakRidingTargetSoc"`  // Target SoC for peak riding (default: 80%)
-    
-    // Solar integration
-    SolarAwareCharging   bool    `json:"solarAwareCharging"`   // Avoid grid charging before sunny days
-    SolarThreshold       float64 `json:"solarThreshold"`       // kWh forecast to consider "sunny day"
-    
-    // Price thresholds
-    MaxChargingPrice     float64 `json:"maxChargingPrice"`     // Never charge above this price
-    PreferredChargeRatio float64 `json:"preferredChargeRatio"` // Prefer charging below this ratio of daily avg
+    // Use 90th percentile for conservative estimate
+    return ce.calculatePercentile(ce.historicalData, 0.9)
 }
 ```
+
+#### 2. Configuration Overview
+
+The dynamic battery optimization is configured through the site configuration YAML (detailed schema provided in Configuration Schema section).
 
 #### 3. Dynamic SoC Optimizer
 ```go
 // Located in core/optimizer/battery_soc.go
 type DynamicSocOptimizer struct {
-    log             *util.Logger
-    config          DynamicBatteryConfig
-    patternAnalyzer *PricePatternAnalyzer
-    solarForecast   api.Rates  // Solar generation forecast
-    battery         api.Battery
-    site            *Site      // To set battery mode
-    capacity        float64
+    log                 *util.Logger
+    config              DynamicBatteryConfig
+    patternAnalyzer     *PricePatternAnalyzer
+    consumptionEstimator *ConsumptionEstimator
+    solarForecast       api.Rates  // Solar generation forecast
+    battery             api.Battery
+    site                *Site      // To set battery mode
+    capacity            float64
 }
 
 type ModeDecision struct {
     BatteryMode   api.BatteryMode `json:"batteryMode"`   // Required battery mode
     TargetSoc     float64         `json:"targetSoc"`     // Target SoC for decision
-    Reasoning     string          `json:"reasoning"`     // Why this mode was chosen
+    Reasoning     string          `json:"reasoning"`     // User-facing explanation of why this mode was chosen
     Strategy      string          `json:"strategy"`      // "peak-riding", "solar-aware", "cost-optimal"
     ValidUntil    time.Time       `json:"validUntil"`    // When to recalculate
 }
@@ -230,12 +246,13 @@ func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
         return api.BatteryNormal  // Allow natural discharge
     }
     
-    // Near target SoC: hold current level
-    if math.Abs(currentSoc - targetSoc) < 5.0 {
+    // At target SoC: hold to preserve energy for peaks
+    if math.Abs(currentSoc - targetSoc) < 2.0 {
         return api.BatteryHold    // Maintain current SoC
     }
     
-    return api.BatteryNormal      // Default behavior
+    // Default: normal operation
+    return api.BatteryNormal
 }
 
 func (dso *DynamicSocOptimizer) calculateOptimalTargetSoc(
@@ -367,16 +384,9 @@ func (dso *DynamicSocOptimizer) detectPricePatterns(rates api.Rates) PricePatter
     peakThreshold := pattern.DailyAverage * dso.config.PatternDetection.PeakSeverityRatio
     pattern.Peaks = dso.findPeaksAboveThreshold(rates, peakThreshold)
     
-    // Assess market conditions dynamically
-    priceRange := dso.calculatePriceRange(rates)
-    spreadRatio := priceRange / pattern.DailyAverage
-    
     // Determine season based on noon/night price relationship
     noonToNightRatio := pattern.NoonAverage / pattern.NightAverage
     pattern.Season = dso.classifySeasonByPrices(noonToNightRatio)
-    
-    // Calculate pattern confidence
-    pattern.Confidence = dso.calculatePatternConfidence(pattern, spreadRatio)
     
     return pattern
 }
@@ -392,31 +402,6 @@ func (dso *DynamicSocOptimizer) classifySeasonByPrices(noonToNightRatio float64)
     return "transitional" // Spring/fall
 }
 
-func (dso *DynamicSocOptimizer) calculatePatternConfidence(
-    pattern PricePattern, 
-    spreadRatio float64,
-) float64 {
-    confidence := 1.0
-    
-    // Reduce confidence if price spread is too narrow
-    minSpread := dso.config.PatternDetection.MinPriceSpreadRatio
-    if spreadRatio < minSpread {
-        confidence *= 0.5 // Low spread = low confidence in patterns
-    }
-    
-    // Reduce confidence if no clear peaks
-    if len(pattern.Peaks) == 0 {
-        confidence *= 0.3
-    }
-    
-    // Reduce confidence for high volatility
-    volatility := dso.calculatePriceVolatility(pattern.Rates)
-    if volatility > 1.5 { // High volatility threshold
-        confidence *= 0.6
-    }
-    
-    return math.Max(0, confidence)
-}
 ```
 
 #### Round-Trip Efficiency Integration
@@ -425,7 +410,7 @@ func (dso *DynamicSocOptimizer) calculatePatternConfidence(
 
 ```go
 type EfficiencyCalculator struct {
-    roundTripEfficiency float64 // e.g., 0.90 for 90% efficiency
+    roundTripEfficiency float64 // e.g., 0.85 for 85% efficiency
 }
 
 func (ec *EfficiencyCalculator) calculateTrueChargingCost(
@@ -530,37 +515,42 @@ func (srm *SocRangeManager) forceReturnToPreferredRange(
 }
 ```
 
-**Example Scenarios**:
+**SoC Range Management Examples**:
 
-**Scenario 1: Normal Operation**
-```
-Current SoC: 45%
-Preferred Range: 30-80%
-Status: ✅ In range, optimization proceeds normally
-```
+1. **Normal Operation** (45% SoC, 30-80% range): ✅ Optimization proceeds normally
+2. **Temporary Excursion** (85% SoC, 3h outside range): ✅ Allow natural discharge  
+3. **Force Return** (85% SoC, 14h outside range): ⚠️ Force discharge regardless of economics
+4. **Emergency Protection** (Target 25%, Emergency min 10%): ⚠️ Clamp to preferred minimum (30%)
 
-**Scenario 2: Temporary Excursion**
-```
-Current SoC: 85% (after charging during negative prices)
-Preferred Range: 30-80%
-Time outside: 3 hours
-Status: ✅ Outside range but < 12 hours, allow natural discharge
-```
+##### Optimization Scheduling
 
-**Scenario 3: Force Return to Range**
-```
-Current SoC: 85%
-Preferred Range: 30-80%
-Time outside: 14 hours
-Status: ⚠️ Force discharge - set target to 80% regardless of economics
-```
+```go
+// Optimization recalculation frequency management
+type OptimizationScheduler struct {
+    recalculateInterval time.Duration // 15 minutes for normal operation
+    priceUpdateTrigger  bool          // Immediate recalc when new prices arrive at 14:00
+    socChangeThreshold  float64       // Recalc if SoC changes >5%
+    lastBatteryMode     api.BatteryMode // Track when mode actually changes
+}
 
-**Scenario 4: Emergency Protection**
-```
-Target SoC: 25% (algorithm wants to discharge)
-Emergency Min: 10%
-Preferred Min: 30%
-Status: ⚠️ Clamp to 30% (preferred min) or 10% (if emergency)
+func (os *OptimizationScheduler) shouldRecalculate(
+    currentSoc float64,
+    lastCalculation time.Time,
+) bool {
+    // Always recalculate when new price data arrives (daily at 14:00)
+    if os.priceUpdateTrigger {
+        return true
+    }
+    
+    // Recalculate on significant SoC changes
+    socChange := math.Abs(currentSoc - os.lastSocReading)
+    if socChange > os.socChangeThreshold {
+        return true
+    }
+    
+    // Regular interval recalculation
+    return time.Since(lastCalculation) > os.recalculateInterval
+}
 ```
 
 #### 4. Integration Points
@@ -627,6 +617,7 @@ func (site *Site) checkEmergencyCharging() {
 }
 ```
 
+
 ### Battery Mode Decision Examples
 
 #### Example 1: Normal Day with Evening Peak
@@ -692,7 +683,6 @@ site:
     
     # Cost optimization parameters
     minSavingsPerKwh: 0.02          # €0.02 minimum savings required to charge
-    maxChargingPrice: 0.40          # Never charge above €0.40/kWh
     
     # Battery efficiency and physical constraints
     battery:
@@ -727,9 +717,6 @@ site:
     patternDetection:
       peakSeverityRatio: 1.4       # Price must be 1.4x+ daily average to be a "peak"
       minPriceSpreadRatio: 0.2     # Min spread (cheapest/most expensive) as ratio of avg price
-      seasonalAdaptation: true     # Adapt summer/winter patterns automatically
-      confidenceThreshold: 0.6     # Minimum pattern confidence for optimization
-      historicalDays: 7            # Days of history for learning patterns
     
     # Battery charging constraints (for planning calculations)
     charging:
@@ -738,14 +725,8 @@ site:
     # Emergency and safety fallbacks
     safety:
       emergencyChargeSoc: 15       # Always charge below this SoC regardless of prices
-      # Note: When rate data unavailable, system defers to inverter native behavior
-      # except for emergency charging below emergencyChargeSoc
+      # Note: When disabled or rate data unavailable, system defers to existing battery logic
     
-    # Coordination with EV charging
-    coordination:
-      allowSimultaneous: false     # Allow simultaneous EV and battery charging
-      evPriority: true             # EV charging takes priority during conflicts
-      maxTotalPower: 11000         # Max combined EV + battery power (W)
 ```
 
 ### API Endpoints
@@ -826,7 +807,6 @@ GET /api/site/batteryOptimization/decision
 │                                                             │
 │ Cost Optimization                                           │
 │ Min savings required: [0.02] €/kWh                         │
-│ Max charging price: [0.40] €/kWh                           │
 │                                                             │
 │ Solar Integration                                           │
 │ ☑️ Avoid charging before sunny days                        │
@@ -867,219 +847,7 @@ GET /api/site/batteryOptimization/decision
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### SoC Range Alert Example
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Battery Optimization Status                          🔋 85% │
-├─────────────────────────────────────────────────────────────┤
-│ Current Strategy: Range Management Priority            ⚠️  │
-│ 🔋 SoC above preferred range for 13 hours - forcing return │
-│                                                             │
-│ Next Action: Natural discharge to 80%                      │
-│ Economic charging suspended until back in range            │
-│                                                             │
-│ SoC Health: ⚠️ Above preferred range (30-80%)              │
-│ ████████████████████████████████████████▓▓▓▓▓▓▓▓▓▓ 30% ←→ 80%│
-│ Time outside range: 13h / 12h limit exceeded              │
-│                                                             │
-│ Return to normal optimization when SoC ≤ 80%               │
-└─────────────────────────────────────────────────────────────┘
-```
 
-#### Detailed Price Pattern View
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Price Pattern Analysis                               [×]    │
-├─────────────────────────────────────────────────────────────┤
-│ Season: Summer • Pattern: High Solar + Evening Peak        │
-│                                                             │
-│ Detected Peaks:                                             │
-│ 🌅 Morning: 07:00-09:00 • €0.35 avg • 1.4x daily avg      │
-│ 🌆 Evening: 18:00-21:00 • €0.42 avg • 1.7x daily avg      │
-│                                                             │
-│ Low Price Periods:                                          │
-│ 🌙 Night: 00:00-06:00 • €0.18 avg                          │
-│ ☀️ Solar: 10:00-14:00 • €0.08 avg • Negative prices possible│
-│                                                             │
-│ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
-│ Optimization Decision:                                      │
-│ ✅ Avoid night charging (solar forecast 18kWh tomorrow)    │
-│ ✅ Target 75% SoC by 18:00 to ride evening peak           │
-│ ✅ Charge during 11:00-13:00 mixed solar/grid period      │
-│                                                             │
-│ Alternative considered:                                     │
-│ ❌ Night charging (18:00-06:00) - Wasteful before sunny day│
-│                                                             │
-│                                             [OK]           │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Missing Elements Addressed
-
-### **Consumption Forecasting - Simplified Approach**
-As discussed, we're taking a conservative approach rather than complex weather forecasting:
-
-```go
-type ConsumptionEstimator struct {
-    historicalData []float64  // kWh per day for last 30 days
-    config         ConsumptionConfig
-}
-
-func (ce *ConsumptionEstimator) estimateDailyConsumption() float64 {
-    if len(ce.historicalData) < 7 {
-        // Not enough history, use static fallback
-        consumption := ce.config.StaticFallbackKwh
-        if ce.isWeekend() {
-            consumption *= ce.config.WeekendReduction
-        }
-        return consumption
-    }
-    
-    // Use 90th percentile for conservative estimate
-    return ce.calculatePercentile(ce.historicalData, 0.9)
-}
-```
-
-### **MinSoC Validation and Safety Checks**
-```go
-type MinSocValidator struct {
-    config DynamicBatteryConfig
-}
-
-func (msv *MinSocValidator) validateAndClampMinSoc(
-    proposedMinSoc float64,
-    currentSoc float64,
-) float64 {
-    // Apply absolute safety limits first
-    if proposedMinSoc > float64(msv.config.SocRange.EmergencyMax) {
-        return float64(msv.config.SocRange.EmergencyMax)
-    }
-    if proposedMinSoc < float64(msv.config.SocRange.EmergencyMin) {
-        return float64(msv.config.SocRange.EmergencyMin)
-    }
-    
-    // Apply SoC range health constraints
-    return msv.applySocRangeConstraints(proposedMinSoc, currentSoc)
-}
-
-func (msv *MinSocValidator) applySocRangeConstraints(
-    targetMinSoc float64,
-    currentSoc float64,
-) float64 {
-    // If we've been outside preferred range too long, force return
-    if msv.hasBeenOutsideRangeTooLong(currentSoc) {
-        preferredMin := float64(msv.config.SocRange.PreferredMin)
-        preferredMax := float64(msv.config.SocRange.PreferredMax)
-        
-        if currentSoc > preferredMax {
-            // Force discharge by setting low minSoC
-            return preferredMin
-        }
-        if currentSoc < preferredMin {
-            // Force charge by setting high minSoC
-            return math.Max(targetMinSoc, preferredMin)
-        }
-    }
-    
-    return targetMinSoc
-}
-```
-
-### **Performance & Resource Considerations**
-```go
-// Optimization recalculation frequency for minSoC updates
-type OptimizationScheduler struct {
-    recalculateInterval time.Duration // 15 minutes for normal operation
-    priceUpdateTrigger  bool          // Immediate recalc when new prices arrive at 14:00
-    socChangeThreshold  float64       // Recalc if SoC changes >5%
-    lastMinSocTarget    float64       // Track when target actually changes
-}
-
-func (os *OptimizationScheduler) shouldRecalculate(
-    currentSoc float64,
-    lastCalculation time.Time,
-) bool {
-    // Always recalculate when new price data arrives (daily at 14:00)
-    if os.priceUpdateTrigger {
-        return true
-    }
-    
-    // Recalculate on significant SoC changes
-    socChange := math.Abs(currentSoc - os.lastMinSocTarget)
-    if socChange > os.socChangeThreshold {
-        return true
-    }
-    
-    // Regular interval recalculation
-    return time.Since(lastCalculation) > os.recalculateInterval
-}
-```
-
-### **Manual Override - Simplified On/Off Only**
-```yaml
-# User only sees this simple interface
-dynamicBatteryOptimization:
-  enable: true  # Just on/off - no complex manual controls
-```
-
-When `enable: false`:
-- All optimization stops immediately
-- Battery mode reverts to existing EVCC behavior
-- Inverter handles battery according to its native logic
-
-**Rate Data Failure Behavior:**
-When tariff API is unavailable:
-- Optimization disabled (no price data = no economic decisions)
-- System defers to inverter's native battery management
-- **Exception**: Emergency charging still active if SoC drops below 15%
-
-### **Grid Power Limitations**
-```go
-func (dso *DynamicSocOptimizer) respectPowerLimits(
-    chargingSlots []ChargeSlot,
-) []ChargeSlot {
-    maxBatteryPower := dso.config.Coordination.MaxTotalPower
-    
-    // If EV is charging, reduce battery power accordingly
-    if dso.isEVCharging() {
-        availablePower := maxBatteryPower - dso.getCurrentEVPower()
-        return dso.adjustSlotsForPowerLimit(chargingSlots, availablePower)
-    }
-    
-    return chargingSlots
-}
-```
-
-### **Error Handling & Fallbacks**
-```go
-type FallbackManager struct {
-    lastKnownRates    api.Rates
-    lastUpdateTime    time.Time
-}
-
-func (fm *FallbackManager) handleRateDataFailure(currentSoc float64) OptimizationStrategy {
-    // When no price data available, disable optimization entirely
-    // Let inverter handle battery according to its native logic
-    
-    // Only intervene for emergency charging
-    if fm.handleEmergencyCharging(currentSoc) {
-        return EmergencyChargeStrategy{
-            targetSoc: float64(fm.config.Safety.EmergencyChargeSoc + 5), // Charge to 20% for safety buffer
-            reason: "Emergency charging - SoC below safety threshold",
-        }
-    }
-    
-    // Otherwise, hands off - let inverter do its thing
-    return HandsOffStrategy{
-        reason: "No rate data available - deferring to inverter native behavior",
-    }
-}
-
-func (fm *FallbackManager) handleEmergencyCharging(currentSoc float64) bool {
-    emergencyThreshold := fm.config.Safety.EmergencyChargeSoc
-    return currentSoc <= float64(emergencyThreshold)
-}
-```
 
 ## Implementation Plan
 
@@ -1248,10 +1016,10 @@ The market-adaptive algorithms ensure batteries are optimally managed across dif
 - **Rationale**: Prevents breakage when markets shift (inflation, new dynamics)
 - **Implementation**: Peak detection, economic viability based on price ratios and patterns
 
-### **3. Direct Cost Parameter Configuration**
-- **Decision**: Direct cost parameters (minSavingsPerKwh, maxChargingPrice) instead of abstract aggressiveness levels
-- **Rationale**: More transparent cost controls, easier to understand and validate behavior
-- **Implementation**: Simple UI with clear cost thresholds, no dropdown complexity
+### **3. Single Economic Threshold Configuration**
+- **Decision**: Single economic threshold (minSavingsPerKwh) for all charging decisions
+- **Rationale**: Eliminates redundant price limits, relies on market-adaptive peak detection for economic viability
+- **Implementation**: Simple UI with one clear cost threshold, maximum transparency
 
 ### **4. Battery Health Integration**
 - **Decision**: SoC range management with time-based constraints
@@ -1325,33 +1093,7 @@ The existing EVCC battery interfaces are **perfectly sufficient** for implementi
 
 #### **Mode-Driven SoC Optimization Strategy**
 
-The dynamic SoC optimizer can achieve all required functionality by generating SoC-driven battery mode decisions:
-
-```go
-func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
-    currentSoc float64,
-    targetSoc float64,
-    pricePattern PricePattern,
-) api.BatteryMode {
-    
-    // During cheap periods: encourage charging to target
-    if dso.isInCheapPeriod(pricePattern) && currentSoc < targetSoc {
-        return api.BatteryCharge  // Force charging to reach target
-    }
-    
-    // During expensive periods: allow discharge
-    if dso.isInExpensivePeriod(pricePattern) {
-        return api.BatteryNormal  // Allow natural discharge
-    }
-    
-    // Near target SoC: hold current level
-    if math.Abs(currentSoc - targetSoc) < 5.0 {
-        return api.BatteryHold    // Maintain current SoC
-    }
-    
-    return api.BatteryNormal      // Default behavior
-}
-```
+The dynamic SoC optimizer generates battery mode decisions based on current SoC vs target SoC and price patterns (detailed algorithm implementation provided in Technical Design section).
 
 #### **Implementation Advantages**
 
@@ -1378,23 +1120,6 @@ func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
 | Status Monitoring | Site-level APIs | HTTP endpoints for optimization status |
 | Configuration | YAML site config | Extend existing configuration schema |
 
-### **Revised Architecture - Mode-Based Control**
-
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Price Pattern │    │ Dynamic SoC      │    │ Battery Mode    │
-│   Analyzer      │──→ │ Optimizer        │──→ │ Decision        │
-│    (New)        │    │    (New)         │    │    (New)        │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                │                        │
-                                ▼                        ▼
-                       ┌──────────────────┐    ┌─────────────────┐
-                       │  Current SoC     │    │ Existing Battery│
-                       │  Reading         │    │ Control System  │
-                       │  (Existing)      │    │   (Existing)    │
-                       └──────────────────┘    └─────────────────┘
-```
-
 **Key Architectural Benefits:**
 - **Minimal Integration Impact**: Extends existing battery control without disruption
 - **Proven Reliability**: Builds on battle-tested battery management logic
@@ -1417,7 +1142,7 @@ The current EVCC battery interfaces are **fully adequate** for implementing the 
 
 ### **Final Implementation Summary**
 - **Total Estimated Timeline**: 9-12 weeks across 4 phases
-- **User Configuration Complexity**: 5 key parameters with smart defaults
+- **User Configuration Complexity**: Single economic threshold (minSavingsPerKwh) with smart defaults
 - **System Integration Impact**: Extends existing EVCC battery management, **zero interface changes required**
 - **Core Innovation**: Market-adaptive mode-driven SoC targeting with efficiency-aware economics
 - **Interface Compatibility**: **100% compatible** with existing EVCC battery control architecture
