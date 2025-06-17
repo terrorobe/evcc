@@ -556,49 +556,69 @@ func (os *OptimizationScheduler) shouldRecalculate(
 #### 4. Integration Points
 
 ##### Site-Level Integration
-```go
-// Extends core/site.go
-type Site struct {
-    // ... existing fields
-    dynamicBatteryOptimizer *DynamicSocOptimizer
-    currentBatteryMode      api.BatteryMode
-    lastOptimizationTime    time.Time
-}
+**Integration with `core/site_battery.go`**
 
-func (site *Site) updateBatteryOptimization() {
-    if !site.dynamicBatteryOptimizationEnabled() {
-        site.currentBatteryMode = api.BatteryNormal // Revert to normal mode
-        site.SetBatteryMode(api.BatteryNormal)
-        return
+The dynamic battery optimizer integrates directly into the existing `requiredBatteryMode` function:
+
+```go
+// Enhanced requiredBatteryMode in core/site_battery.go
+func (site *Site) requiredBatteryMode(batteryGridChargeActive bool, rate api.Rate) api.BatteryMode {
+    // ... existing logic for external mode, reset logic ...
+
+    switch {
+    case !site.batteryConfigured():
+        res = api.BatteryUnknown
+    case extModeReset:
+        res = api.BatteryNormal
+    case extMode != api.BatteryUnknown:
+        if extMode != batMode {
+            res = extMode
+        }
+    case site.dynamicBatteryOptimizationActive():
+        // NEW: Dynamic optimization takes priority over legacy grid charge logic
+        res = site.requiredBatteryModeOptimized(rate)
+    case batteryGridChargeActive:
+        res = mapper(api.BatteryCharge)
+    case site.dischargeControlActive(rate):
+        res = mapper(api.BatteryHold)
+    case batteryModeModified(batMode):
+        res = api.BatteryNormal
     }
 
-    // Get current price pattern
-    pricePattern := site.dynamicBatteryOptimizer.patternAnalyzer.AnalyzePattern(site.rates)
+    return res
+}
 
-    // Calculate optimal battery mode
+// NEW: Dynamic battery mode determination
+func (site *Site) requiredBatteryModeOptimized(rate api.Rate) api.BatteryMode {
+    // Emergency charging always takes priority
+    emergencyThreshold := float64(site.config.DynamicBatteryOptimization.Safety.EmergencyChargeSoc)
+    if site.batterySoc <= emergencyThreshold {
+        return api.BatteryCharge
+    }
+
+    // Get optimization decision
+    pricePattern := site.dynamicBatteryOptimizer.patternAnalyzer.AnalyzePattern(site.rates)
     decision := site.dynamicBatteryOptimizer.OptimizeBatteryMode(
-        site.batterySoc,
-        pricePattern,
-        site.solarForecast,
-        site.estimatedConsumption,
+        site.batterySoc, pricePattern, site.solarForecast, site.estimatedConsumption,
     )
 
-    // Apply the new battery mode
-    site.setBatteryModeOptimized(decision.BatteryMode, decision.Reasoning)
-    site.lastOptimizationTime = time.Now()
+    return decision.BatteryMode
 }
 
-func (site *Site) setBatteryModeOptimized(mode api.BatteryMode, reasoning string) {
-    if site.currentBatteryMode != mode {
-        site.log.INFO.Printf("Battery mode changed: %v -> %v (%s)",
-                           site.currentBatteryMode, mode, reasoning)
-        site.currentBatteryMode = mode
-
-        // Apply to actual battery system via existing EVCC API
-        site.SetBatteryMode(mode)
-    }
+// Check if dynamic optimization should be active
+func (site *Site) dynamicBatteryOptimizationActive() bool {
+    return site.config.DynamicBatteryOptimization.Enable && 
+           site.dynamicBatteryOptimizer != nil &&
+           site.rates != nil // Require rate data for optimization
 }
 ```
+
+**Integration Benefits:**
+- ✅ **Preserves existing behavior** when optimization is disabled
+- ✅ **Respects external battery mode** - external control takes priority  
+- ✅ **Maintains emergency safety** - emergency charging logic preserved
+- ✅ **Inherits coordination** - EV charging, discharge control handled by existing logic
+- ✅ **Single entry point** - all battery decisions flow through `requiredBatteryMode`
 
 ##### Emergency Override Integration
 ```go
