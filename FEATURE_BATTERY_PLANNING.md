@@ -159,20 +159,25 @@ func (ppa *PricePatternAnalyzer) AnalyzePattern(rates api.Rates) PricePattern {
     pattern.NightAverage = ppa.calculateTimeAverage(rates, 0, 6)  // 00:00-06:00
 
     // Detect peaks using configurable ratio relative to daily average
-    peakThreshold := pattern.DailyAverage * 1.4 // Configurable ratio
-    pattern.Peaks = ppa.findPeaksAboveThreshold(rates, peakThreshold)
+    pattern.Peaks = ppa.DetectPeaks(rates)
 
     // Determine season based on noon/night price relationship
-    noonToNightRatio := pattern.NoonAverage / pattern.NightAverage
-    pattern.Season = ppa.classifySeasonByPrices(noonToNightRatio)
+    pattern.Season = ppa.ClassifySeason(pattern)
 
     return pattern
 }
 
-func (ppa *PricePatternAnalyzer) DetectPeaks(rates api.Rates) []PricePeak
-func (ppa *PricePatternAnalyzer) ClassifySeason(pattern PricePattern) string
+func (ppa *PricePatternAnalyzer) DetectPeaks(rates api.Rates) []PricePeak {
+    // Calculate adaptive thresholds based on actual price data
+    dailyAverage := ppa.calculateAverage(rates)
+    peakThreshold := dailyAverage * 1.4 // Configurable ratio
+    return ppa.findPeaksAboveThreshold(rates, peakThreshold)
+}
 
-func (ppa *PricePatternAnalyzer) classifySeasonByPrices(noonToNightRatio float64) string {
+func (ppa *PricePatternAnalyzer) ClassifySeason(pattern PricePattern) string {
+    // Determine season based on noon/night price relationship
+    noonToNightRatio := pattern.NoonAverage / pattern.NightAverage
+    
     // These thresholds are adaptive - they could be learned over time
     if noonToNightRatio < 0.7 {
         return "summer" // Noon significantly cheaper (high solar impact)
@@ -219,6 +224,7 @@ type DynamicSocOptimizer struct {
     config              DynamicBatteryConfig
     patternAnalyzer     *PricePatternAnalyzer
     consumptionEstimator *ConsumptionEstimator
+    socRangeManager     *SocRangeManager
     solarForecast       api.Rates  // Solar generation forecast
     battery             api.Battery
     site                *Site      // To set battery mode
@@ -317,7 +323,7 @@ func (dso *DynamicSocOptimizer) calculateOptimalTargetSoc(
     }
 
     // Apply SoC range constraints and return
-    return dso.applySocRangeConstraints(peakRidingTarget, currentSoc)
+    return dso.socRangeManager.applySocRangeConstraints(peakRidingTarget, currentSoc)
 }
 ```
 
@@ -431,36 +437,6 @@ func (dso *DynamicSocOptimizer) isStrategicChargingBeneficial(
 #### Round-Trip Efficiency Integration
 
 **Key Principle**: All optimization decisions must account for the fact that storing and retrieving energy from the battery is lossy.
-
-```go
-type EfficiencyCalculator struct {
-    roundTripEfficiency float64 // e.g., 0.85 for 85% efficiency
-}
-
-func (ec *EfficiencyCalculator) calculateTrueChargingCost(
-    gridPrice float64,
-    energyNeeded float64,
-) float64 {
-    // Energy we need to buy from grid to store energyNeeded usable energy
-    energyToBuy := energyNeeded / ec.roundTripEfficiency
-    return gridPrice * energyToBuy
-}
-
-func (ec *EfficiencyCalculator) isChargingWorthwhile(
-    chargingPrice float64,
-    peakPrice float64,
-) bool {
-    // True cost including round-trip losses
-    effectiveChargingCost := chargingPrice / ec.roundTripEfficiency
-
-    // Only worthwhile if we save money after accounting for losses
-    return effectiveChargingCost < peakPrice * 0.95 // 5% margin for certainty
-}
-
-// Example: With 85% efficiency and 10¢ charging vs 30¢ peak:
-// Effective charging cost: 10¢ / 0.85 = 11.8¢
-// Worthwhile? 11.8¢ < 28.5¢ (30¢ * 0.95) = YES, saves 16.7¢ per kWh
-```
 
 **Impact on Strategy Selection**:
 - **Negative Prices**: Always beneficial regardless of efficiency
