@@ -131,11 +131,12 @@ type PricePatternAnalyzer struct {
 }
 
 type PricePeak struct {
-    Start     time.Time `json:"start"`
-    End       time.Time `json:"end"`
-    AvgPrice  float64   `json:"avgPrice"`
-    Severity  float64   `json:"severity"`  // Price ratio vs daily average
-    Type      string    `json:"type"`      // "morning" or "evening"
+    Start     time.Time     `json:"start"`
+    End       time.Time     `json:"end"`
+    Duration  time.Duration `json:"duration"`  // Peak duration
+    AvgPrice  float64       `json:"avgPrice"`
+    Severity  float64       `json:"severity"`  // Price ratio vs daily average
+    Type      string        `json:"type"`      // "morning" or "evening"
 }
 
 type PricePattern struct {
@@ -147,9 +148,40 @@ type PricePattern struct {
     Season        string      `json:"season"`         // "summer" or "winter"
 }
 
-func (ppa *PricePatternAnalyzer) AnalyzePattern(rates api.Rates) PricePattern
+func (ppa *PricePatternAnalyzer) AnalyzePattern(rates api.Rates) PricePattern {
+    pattern := PricePattern{
+        Date: time.Now(),
+    }
+
+    // Calculate adaptive thresholds based on actual price data
+    pattern.DailyAverage = ppa.calculateAverage(rates)
+    pattern.NoonAverage = ppa.calculateTimeAverage(rates, 10, 14) // 10:00-14:00
+    pattern.NightAverage = ppa.calculateTimeAverage(rates, 0, 6)  // 00:00-06:00
+
+    // Detect peaks using configurable ratio relative to daily average
+    peakThreshold := pattern.DailyAverage * 1.4 // Configurable ratio
+    pattern.Peaks = ppa.findPeaksAboveThreshold(rates, peakThreshold)
+
+    // Determine season based on noon/night price relationship
+    noonToNightRatio := pattern.NoonAverage / pattern.NightAverage
+    pattern.Season = ppa.classifySeasonByPrices(noonToNightRatio)
+
+    return pattern
+}
+
 func (ppa *PricePatternAnalyzer) DetectPeaks(rates api.Rates) []PricePeak
 func (ppa *PricePatternAnalyzer) ClassifySeason(pattern PricePattern) string
+
+func (ppa *PricePatternAnalyzer) classifySeasonByPrices(noonToNightRatio float64) string {
+    // These thresholds are adaptive - they could be learned over time
+    if noonToNightRatio < 0.7 {
+        return "summer" // Noon significantly cheaper (high solar impact)
+    }
+    if noonToNightRatio > 0.9 {
+        return "winter" // Similar prices (low solar impact)
+    }
+    return "transitional" // Spring/fall
+}
 ```
 
 #### 1.1. Consumption Estimator
@@ -246,6 +278,23 @@ func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
         return api.BatteryNormal  // Allow natural discharge
     }
 
+    // Strategic decisions for upcoming peaks
+    upcomingPeak := dso.getNextExpensivePeriod(pattern, currentTime)
+    if upcomingPeak != nil {
+        currentPrice := dso.getCurrentPrice(pattern, currentTime)
+        
+        // Strategic charging during moderate prices before expensive peaks
+        if currentSoc < targetSoc && dso.isStrategicChargingBeneficial(currentPrice, upcomingPeak.AvgPrice) {
+            return api.BatteryCharge
+        }
+        
+        // Strategic holding: preserve SoC when beneficial for upcoming peaks
+        requiredPeakRidingSoc := dso.calculatePeakRidingSoc(pattern.Peaks)
+        if currentPrice < upcomingPeak.AvgPrice && currentSoc <= requiredPeakRidingSoc {
+            return api.BatteryHold
+        }
+    }
+
     // At target SoC: hold to preserve energy for peaks
     if math.Abs(currentSoc - targetSoc) < 2.0 {
         return api.BatteryHold    // Maintain current SoC
@@ -317,28 +366,6 @@ func (dso *DynamicSocOptimizer) shouldAvoidChargingBeforeSolar() bool {
 **Objective**: Only set high minSoC targets when economically beneficial
 
 ```go
-func (dso *DynamicSocOptimizer) isChargingEconomicallyViable(
-    currentPrice float64,
-    pattern PricePattern,
-) bool {
-    // Calculate effective cost including round-trip losses and wear
-    effectiveCost := (currentPrice / dso.config.Battery.RoundTripEfficiency) +
-                     dso.config.Battery.WearCostPerKwh
-
-    // Compare against upcoming peak prices
-    upcomingPeaks := dso.getUpcomingPeaks(pattern.Peaks)
-    if len(upcomingPeaks) == 0 {
-        return false // No upcoming peaks to prepare for
-    }
-
-    avgPeakPrice := dso.calculateAveragePeakPrice(upcomingPeaks)
-    minSavings := dso.config.Optimization.MinSavingsPerKwh
-
-    // Only economically viable if we save more than minimum threshold
-    savings := avgPeakPrice - effectiveCost
-    return savings > minSavings
-}
-
 func (dso *DynamicSocOptimizer) isInCheapPeriod(
     pattern PricePattern,
     currentTime time.Time,
@@ -346,7 +373,17 @@ func (dso *DynamicSocOptimizer) isInCheapPeriod(
     currentPrice := dso.getCurrentPrice(pattern, currentTime)
 
     // Check if current price is economically viable for charging
-    if !dso.isChargingEconomicallyViable(currentPrice, pattern) {
+    effectiveCost := dso.calculateEffectiveCost(currentPrice)
+
+    upcomingPeaks := dso.getUpcomingPeaks(pattern.Peaks)
+    if len(upcomingPeaks) == 0 {
+        return false // No upcoming peaks to prepare for
+    }
+
+    avgPeakPrice := dso.calculateAveragePeakPrice(upcomingPeaks)
+    savings := avgPeakPrice - effectiveCost
+
+    if savings <= dso.config.Optimization.MinSavingsPerKwh {
         return false
     }
 
@@ -364,44 +401,31 @@ func (dso *DynamicSocOptimizer) isInExpensivePeriod(
     expensiveThreshold := pattern.DailyAverage * 1.2 // 20% above average
     return currentPrice > expensiveThreshold
 }
-```
 
-#### Market-Adaptive Pattern Detection
-
-```go
-func (dso *DynamicSocOptimizer) detectPricePatterns(rates api.Rates) PricePattern {
-    pattern := PricePattern{
-        Date:  time.Now(),
-        Rates: rates,
+func (dso *DynamicSocOptimizer) getNextExpensivePeriod(
+    pattern PricePattern,
+    currentTime time.Time,
+) *PricePeak {
+    for _, peak := range pattern.Peaks {
+        if peak.Start.After(currentTime) {
+            return &peak
+        }
     }
-
-    // Calculate adaptive thresholds based on actual price data
-    pattern.DailyAverage = dso.calculateAverage(rates)
-    pattern.NoonAverage = dso.calculateTimeAverage(rates, 10, 14) // 10:00-14:00
-    pattern.NightAverage = dso.calculateTimeAverage(rates, 0, 6)  // 00:00-06:00
-
-    // Detect peaks using configurable ratio relative to daily average
-    peakThreshold := pattern.DailyAverage * dso.config.PatternDetection.PeakSeverityRatio
-    pattern.Peaks = dso.findPeaksAboveThreshold(rates, peakThreshold)
-
-    // Determine season based on noon/night price relationship
-    noonToNightRatio := pattern.NoonAverage / pattern.NightAverage
-    pattern.Season = dso.classifySeasonByPrices(noonToNightRatio)
-
-    return pattern
+    return nil
 }
 
-func (dso *DynamicSocOptimizer) classifySeasonByPrices(noonToNightRatio float64) string {
-    // These thresholds are adaptive - they could be learned over time
-    if noonToNightRatio < 0.7 {
-        return "summer" // Noon significantly cheaper (high solar impact)
-    }
-    if noonToNightRatio > 0.9 {
-        return "winter" // Similar prices (low solar impact)
-    }
-    return "transitional" // Spring/fall
+func (dso *DynamicSocOptimizer) calculateEffectiveCost(price float64) float64 {
+    return (price / dso.config.Battery.RoundTripEfficiency) + dso.config.Battery.WearCostPerKwh
 }
 
+func (dso *DynamicSocOptimizer) isStrategicChargingBeneficial(
+    currentPrice float64,
+    peakPrice float64,
+) bool {
+    effectiveCost := dso.calculateEffectiveCost(currentPrice)
+    savings := peakPrice - effectiveCost
+    return savings > dso.config.Optimization.MinSavingsPerKwh
+}
 ```
 
 #### Round-Trip Efficiency Integration
@@ -531,6 +555,7 @@ type OptimizationScheduler struct {
     priceUpdateTrigger  bool          // Immediate recalc when new prices arrive at 14:00
     socChangeThreshold  float64       // Recalc if SoC changes >5%
     lastBatteryMode     api.BatteryMode // Track when mode actually changes
+    lastSocReading      float64       // Track SoC changes for recalculation triggers
 }
 
 func (os *OptimizationScheduler) shouldRecalculate(
@@ -591,7 +616,7 @@ func (site *Site) requiredBatteryMode(batteryGridChargeActive bool, rate api.Rat
 // NEW: Dynamic battery mode determination
 func (site *Site) requiredBatteryModeOptimized(rate api.Rate) api.BatteryMode {
     // Emergency charging always takes priority
-    emergencyThreshold := float64(site.config.DynamicBatteryOptimization.Safety.EmergencyChargeSoc)
+    emergencyThreshold := float64(site.config.DynamicBatteryOptimization.SocRange.EmergencyMin)
     if site.batterySoc <= emergencyThreshold {
         return api.BatteryCharge
     }
@@ -601,6 +626,10 @@ func (site *Site) requiredBatteryModeOptimized(rate api.Rate) api.BatteryMode {
     decision := site.dynamicBatteryOptimizer.OptimizeBatteryMode(
         site.batterySoc, pricePattern, site.solarForecast, site.estimatedConsumption,
     )
+
+    // Store the target SoC for UI display and status reporting
+    site.dynamicBatteryTargetSoc = decision.TargetSoc
+    site.dynamicBatteryDecision = decision
 
     return decision.BatteryMode
 }
@@ -624,7 +653,7 @@ func (site *Site) dynamicBatteryOptimizationActive() bool {
 ```go
 // Extends core/site_battery.go
 func (site *Site) checkEmergencyCharging() {
-    emergencyThreshold := float64(site.config.DynamicBatteryOptimization.Safety.EmergencyChargeSoc)
+    emergencyThreshold := float64(site.config.DynamicBatteryOptimization.SocRange.EmergencyMin)
 
     if site.batterySoc <= emergencyThreshold {
         site.log.WARN.Printf("Emergency charging activated: SoC %.1f%% <= %.1f%% threshold",
@@ -673,7 +702,47 @@ Battery Mode: api.BatteryNormal
 Reasoning: "Expensive period - allowing discharge to avoid €0.45/kWh grid power"
 ```
 
-#### Example 3: Solar-Aware Charging Avoidance
+#### Example 3: Strategic Night Charging
+```
+Time: 02:00
+Current SoC: 50%
+Night Price: €0.20/kWh (moderate - not "cheap" but below morning peak)
+Morning Peak: 07:00-09:00 (€0.40/kWh)
+Target SoC: 75%
+
+Algorithm Decision:
+- Not in cheap period: €0.20 > daily average ❌
+- Not in expensive period: €0.20 < €0.30 (120% of €0.25 avg) ❌
+- Strategic charging check: upcoming peak at 07:00 ✅
+- Economic viability: (€0.20 ÷ 0.85) + €0.10 = €0.34 effective cost
+- Peak price: €0.40, savings: €0.06 > €0.02 minimum ✅
+- Current SoC: 50% < 75% target ✅
+
+Battery Mode: api.BatteryCharge
+Reasoning: "Strategic charging before morning peak - moderate price saves €0.06/kWh vs peak"
+```
+
+#### Example 4: Strategic Morning Holding
+```
+Time: 05:00
+Current SoC: 40%
+Required Peak-riding SoC: 45%
+Current Price: €0.28/kWh (expensive - not viable for charging)
+Morning Peak: 07:00-09:00 (€0.45/kWh)
+
+Algorithm Decision:
+- Not in cheap period: €0.28 > daily average ❌
+- In expensive period: €0.28 > €0.30 threshold ✅ 
+- But strategic charging not beneficial: (€0.28 ÷ 0.85) + €0.10 = €0.43 effective cost
+- Peak price: €0.45, savings: €0.02 = minimum threshold (marginal) ❌
+- Strategic holding check: currentPrice (€0.28) < peakPrice (€0.45) ✅
+- Current SoC: 40% <= 45% required ✅
+
+Battery Mode: api.BatteryHold
+Reasoning: "Preserving SoC for morning peak - current €0.28 < peak €0.45/kWh"
+```
+
+#### Example 5: Solar-Aware Charging Avoidance
 ```
 Time: 02:00
 Current SoC: 40%
@@ -701,9 +770,6 @@ site:
   dynamicBatteryOptimization:
     enable: true
 
-    # Cost optimization parameters
-    minSavingsPerKwh: 0.02          # €0.02 minimum savings required to charge
-
     # Battery efficiency and physical constraints
     battery:
       roundTripEfficiency: 0.85    # 85% efficiency (15% loss) - configurable
@@ -718,7 +784,9 @@ site:
       emergencyMax: 95             # Absolute maximum SoC (never go above)
 
     # Optimization behavior
-    safetyMarginPercent: 10         # Additional SoC margin above calculated minimum (%)
+    optimization:
+      minSavingsPerKwh: 0.02        # €0.02 minimum savings required to charge
+      safetyMarginPercent: 10       # Additional SoC margin above calculated minimum (%)
 
     # Consumption estimation for SoC target calculation
     consumption:
@@ -742,10 +810,8 @@ site:
     charging:
       maxChargeRateKw: 5.0         # Maximum charging rate in kW (used for time estimates)
 
-    # Emergency and safety fallbacks
-    safety:
-      emergencyChargeSoc: 15       # Always charge below this SoC regardless of prices
-      # Note: When disabled or rate data unavailable, system defers to existing battery logic
+    # Note: Emergency charging handled by socRange.emergencyMin threshold
+    # When disabled or rate data unavailable, system defers to existing battery logic
 
 ```
 
@@ -762,6 +828,7 @@ PUT /api/config/site/dynamicBatteryOptimization
 GET /api/site/batteryOptimization/status
 GET /api/site/batteryOptimization/pricePattern
 GET /api/site/batteryOptimization/decision
+GET /api/site/batteryOptimization/targetSoc
 ```
 
 **Status Response:**
@@ -844,7 +911,7 @@ GET /api/site/batteryOptimization/decision
 #### Dynamic Battery Optimization Dashboard
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Battery Optimization Status                          🔋 45% │
+│ Battery Optimization Status              🔋 45% → 🎯 75% │
 ├─────────────────────────────────────────────────────────────┤
 │ Current Strategy: Solar-Aware Charging                     │
 │ 🌞 Waiting for tomorrow's 18kWh solar forecast             │
@@ -871,7 +938,7 @@ GET /api/site/batteryOptimization/decision
 
 ## Implementation Plan
 
-### Phase 1: Core Infrastructure (3-4 weeks)
+### Phase 1: Core Infrastructure
 1. **Price Pattern Analyzer**
    - Create `core/analyzer/price_pattern.go`
    - Implement market-adaptive pattern detection
@@ -892,7 +959,7 @@ GET /api/site/batteryOptimization/decision
    - Add coordination with EV charging plans
    - Implement power limit handling
 
-### Phase 2: API & Status System (2-3 weeks)
+### Phase 2: API & Status System
 1. **API Endpoints**
    - Configuration GET/PUT endpoints
    - Status and decision explanation APIs
@@ -908,7 +975,7 @@ GET /api/site/batteryOptimization/decision
    - Solar forecast integration robustness
    - Emergency charging protocols
 
-### Phase 3: UI Implementation (2-3 weeks)
+### Phase 3: UI Implementation
 1. **Simple Configuration UI**
    - On/off toggle
    - Minimum savings threshold setting
@@ -926,7 +993,7 @@ GET /api/site/batteryOptimization/decision
    - Mobile responsive design
    - Alert system for range violations
 
-### Phase 4: Testing & Polish (2 weeks)
+### Phase 4: Testing & Polish
 1. **Comprehensive Testing**
    - Unit tests for all optimization algorithms
    - Integration tests with existing EVCC systems
