@@ -76,20 +76,15 @@ EVCC already provides:
 
 ### Non-Functional Requirements
 
-#### NFR1: Performance
-- **NFR1.1**: Plan calculation within 5 seconds
-- **NFR1.2**: Minimal impact on existing system performance
-- **NFR1.3**: Efficient rate data reuse from existing car plans
+#### NFR1: Reliability
+- **NFR1.1**: Graceful degradation when tariff data unavailable
+- **NFR1.2**: Automatic plan adjustment for unexpected consumption
+- **NFR1.3**: Fallback to simple time-based charging if optimization fails
 
-#### NFR2: Reliability
-- **NFR2.1**: Graceful degradation when tariff data unavailable
-- **NFR2.2**: Automatic plan adjustment for unexpected consumption
-- **NFR2.3**: Fallback to simple time-based charging if optimization fails
-
-#### NFR3: Usability
-- **NFR3.1**: Configuration complexity similar to existing car plans
-- **NFR3.2**: Clear visual feedback on plan effectiveness
-- **NFR3.3**: Intuitive default values and smart suggestions
+#### NFR2: Usability
+- **NFR2.1**: Configuration complexity similar to existing car plans
+- **NFR2.2**: Clear visual feedback on plan effectiveness
+- **NFR2.3**: Intuitive default values and smart suggestions
 
 ## Technical Design
 
@@ -177,7 +172,7 @@ func (ppa *PricePatternAnalyzer) DetectPeaks(rates api.Rates) []PricePeak {
 func (ppa *PricePatternAnalyzer) ClassifySeason(pattern PricePattern) string {
     // Determine season based on noon/night price relationship
     noonToNightRatio := pattern.NoonAverage / pattern.NightAverage
-    
+
     // These thresholds are adaptive - they could be learned over time
     if noonToNightRatio < 0.7 {
         return "summer" // Noon significantly cheaper (high solar impact)
@@ -212,6 +207,14 @@ func (ce *ConsumptionEstimator) estimateDailyConsumption() float64 {
 }
 ```
 
+**TODO - Consumption Data Collection Implementation:**
+- **Data Source**: Use existing site grid power measurements to calculate daily consumption
+- **Storage**: Store daily consumption totals (rolling 30-day window)
+- **Integration Point**: Hook into site update cycle to accumulate daily grid consumption
+- **Persistence**: Store historical data in SQLite database or memory with periodic persistence
+- **Calculation**: `dailyConsumption = gridImport - pvExcess + batteryDischarge - batteryCharge`
+- **Filtering**: Exclude days with incomplete data or system outages
+
 #### 2. Configuration Overview
 
 The dynamic battery optimization is configured through the site configuration YAML (detailed schema provided in Configuration Schema section).
@@ -225,10 +228,13 @@ type DynamicSocOptimizer struct {
     patternAnalyzer     *PricePatternAnalyzer
     consumptionEstimator *ConsumptionEstimator
     socRangeManager     *SocRangeManager
+    scheduler           *OptimizationScheduler
     solarForecast       api.Rates  // Solar generation forecast
     battery             api.Battery
-    site                *Site      // To set battery mode
-    capacity            float64
+    site                *Site      // To set battery mode and access batteryCapacity
+    capacity            float64    // Populated from site.batteryCapacity (auto-detected)
+    lastCalculation     time.Time  // Track when optimization was last calculated
+    lastDecision        ModeDecision // Cache last decision for UI display
 }
 
 type ModeDecision struct {
@@ -243,20 +249,115 @@ func (dso *DynamicSocOptimizer) OptimizeBatteryMode(
     currentSoc float64,
     pricePattern PricePattern,
     solarForecast api.Rates,
-    consumptionForecast float64,
 ) ModeDecision {
-    targetSoc := dso.calculateOptimalTargetSoc(pricePattern, currentSoc)
-    batteryMode := dso.calculateRequiredBatteryMode(currentSoc, targetSoc, pricePattern)
+    // Check if recalculation is needed based on scheduler
+    if !dso.scheduler.shouldRecalculate(currentSoc, dso.lastCalculation) {
+        // Return cached decision if still valid
+        if time.Now().Before(dso.lastDecision.ValidUntil) {
+            return dso.lastDecision
+        }
+    }
 
-    return ModeDecision{
+    // Update scheduler state
+    dso.scheduler.lastSocReading = currentSoc
+    dso.scheduler.priceUpdateTrigger = false // Reset trigger after processing
+
+    // Update SoC range tracking for battery health monitoring
+    dso.socRangeManager.updateRangeTracking(currentSoc)
+
+    // Get consumption forecast from integrated estimator
+    consumptionForecast := dso.consumptionEstimator.estimateDailyConsumption()
+
+    // Calculate optimal target SoC (includes SoC range constraints)
+    targetSoc := dso.calculateOptimalTargetSoc(pricePattern, currentSoc, consumptionForecast)
+
+    // Check if SoC range constraints should override economic optimization
+    batteryMode := dso.calculateRequiredBatteryMode(currentSoc, targetSoc, pricePattern)
+    if dso.socRangeManager.shouldForceRangeReturn(currentSoc) {
+        // Override economic optimization for battery health
+        batteryMode = dso.calculateRangeForceMode(currentSoc, targetSoc)
+    }
+
+    // Determine strategy and reasoning based on whether range constraints are active
+    var strategy, reasoning string
+    if dso.socRangeManager.shouldForceRangeReturn(currentSoc) {
+        strategy = "battery-health"
+        reasoning = dso.explainRangeForceDecision(currentSoc, targetSoc, batteryMode)
+    } else {
+        strategy = dso.determineStrategy(pricePattern)
+        reasoning = dso.explainDecision(pricePattern, targetSoc, batteryMode)
+    }
+
+    decision := ModeDecision{
         BatteryMode: batteryMode,
         TargetSoc:   targetSoc,
-        Reasoning:   dso.explainDecision(pricePattern, targetSoc, batteryMode),
-        Strategy:    dso.determineStrategy(pricePattern),
+        Reasoning:   reasoning,
+        Strategy:    strategy,
         ValidUntil:  dso.calculateNextRecalculation(),
     }
+
+    // Cache decision and update timing
+    dso.lastDecision = decision
+    dso.lastCalculation = time.Now()
+    dso.scheduler.lastBatteryMode = batteryMode
+
+    return decision
+}
+
+// Called when new price data arrives (typically at 14:00 daily)
+func (dso *DynamicSocOptimizer) OnPriceDataUpdate() {
+    dso.scheduler.priceUpdateTrigger = true
+    dso.log.DEBUG.Println("Price data updated - triggering immediate optimization recalculation")
+}
+
+// Called by site update cycle to check if optimization should be recalculated
+func (dso *DynamicSocOptimizer) ShouldRecalculate(currentSoc float64) bool {
+    return dso.scheduler.shouldRecalculate(currentSoc, dso.lastCalculation)
+}
+
+// Override economic optimization when SoC range constraints force battery health protection
+func (dso *DynamicSocOptimizer) calculateRangeForceMode(currentSoc float64, targetSoc float64) api.BatteryMode {
+    preferredMin := float64(dso.config.SocRange.PreferredMin)
+    preferredMax := float64(dso.config.SocRange.PreferredMax)
+
+    if currentSoc < preferredMin {
+        // Been too low too long - force charge regardless of economics
+        return api.BatteryCharge
+    }
+    if currentSoc > preferredMax {
+        // Been too high too long - force discharge by preventing charging
+        return api.BatteryNormal // Allow natural discharge
+    }
+
+    // Should not reach here, but fallback to normal economic mode
+    return dso.calculateRequiredBatteryMode(currentSoc, targetSoc, PricePattern{})
+}
+
+// Explain decision when SoC range management overrides economic optimization
+func (dso *DynamicSocOptimizer) explainRangeForceDecision(currentSoc float64, targetSoc float64, mode api.BatteryMode) string {
+    preferredMin := float64(dso.config.SocRange.PreferredMin)
+    preferredMax := float64(dso.config.SocRange.PreferredMax)
+    maxHours := dso.config.SocRange.MaxDurationOutsideRange
+
+    if currentSoc < preferredMin {
+        return fmt.Sprintf("Battery health protection: SoC %.1f%% below preferred minimum %.1f%% for >%dh - forcing charge",
+                          currentSoc, preferredMin, maxHours)
+    }
+    if currentSoc > preferredMax {
+        return fmt.Sprintf("Battery health protection: SoC %.1f%% above preferred maximum %.1f%% for >%dh - allowing discharge",
+                          currentSoc, preferredMax, maxHours)
+    }
+
+    return "Battery health protection active"
 }
 ```
+
+**TODO - Site Update Cycle Integration:**
+- **Hook into site.Update()**: Add scheduler check in main site update cycle (typically runs every 10-30 seconds)
+- **Price data triggers**: Connect tariff provider updates to `OnPriceDataUpdate()` method
+- **Optimization frequency**: Normal 15-minute recalculation, immediate on price updates or significant SoC changes
+- **Integration point**: Call `ShouldRecalculate()` in site update loop before calling battery optimization
+- **Caching benefits**: Avoid expensive optimization calculations when conditions haven't changed significantly
 
 ### Algorithm Details
 
@@ -288,14 +389,14 @@ func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
     upcomingPeak := dso.getNextExpensivePeriod(pattern, currentTime)
     if upcomingPeak != nil {
         currentPrice := dso.getCurrentPrice(pattern, currentTime)
-        
+
         // Progressive charging check: do we need to charge now to meet target on time?
         if currentSoc < targetSoc && dso.needsProgressiveCharging(currentSoc, targetSoc, upcomingPeak.Start) {
             if dso.isStrategicChargingBeneficial(currentPrice, upcomingPeak.AvgPrice) {
                 return api.BatteryCharge
             }
         }
-        
+
         // Strategic holding: preserve SoC when beneficial for upcoming peaks
         requiredPeakRidingSoc := dso.calculatePeakRidingSoc(pattern.Peaks)
         if currentPrice < upcomingPeak.AvgPrice && currentSoc <= requiredPeakRidingSoc {
@@ -303,21 +404,25 @@ func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
         }
     }
 
-    // At target SoC: hold to preserve energy for peaks
+    // At target SoC: only hold if there's a strong economic reason
     if math.Abs(currentSoc - targetSoc) < 2.0 {
-        return api.BatteryHold    // Maintain current SoC
+        // Only hold if we're preserving energy for an upcoming expensive period
+        if upcomingPeak != nil && currentPrice < upcomingPeak.AvgPrice {
+            return api.BatteryHold    // Preserve energy for peak
+        }
     }
 
-    // Default: normal operation
+    // Default: defer to existing battery logic (no strong intervention needed)
     return api.BatteryNormal
 }
 
 func (dso *DynamicSocOptimizer) calculateOptimalTargetSoc(
     pattern PricePattern,
     currentSoc float64,
+    consumptionForecast float64,
 ) float64 {
     // Calculate SoC needed to ride through upcoming peaks
-    peakRidingTarget := dso.calculatePeakRidingSoc(pattern.Peaks)
+    peakRidingTarget := dso.calculatePeakRidingSoc(pattern.Peaks, consumptionForecast)
 
     // Apply solar-aware adjustments
     if dso.shouldAvoidChargingBeforeSolar() {
@@ -333,7 +438,7 @@ func (dso *DynamicSocOptimizer) calculateOptimalTargetSoc(
 **Objective**: Calculate sufficient SoC to ride through identified price peaks
 
 ```go
-func (dso *DynamicSocOptimizer) calculatePeakRidingSoc(peaks []PricePeak) float64 {
+func (dso *DynamicSocOptimizer) calculatePeakRidingSoc(peaks []PricePeak, dailyConsumptionForecast float64) float64 {
     if len(peaks) == 0 {
         return float64(dso.config.SocRange.PreferredMin) // No peaks, use minimum
     }
@@ -342,8 +447,8 @@ func (dso *DynamicSocOptimizer) calculatePeakRidingSoc(peaks []PricePeak) float6
     criticalPeak := dso.findMostCriticalPeak(peaks)
 
     // Calculate energy needed to ride through this peak
-    estimatedConsumption := dso.getEstimatedConsumption() // kWh per hour
-    energyRequired := estimatedConsumption * criticalPeak.Duration.Hours()
+    hourlyConsumption := dailyConsumptionForecast / 24.0 // Convert daily to hourly estimate
+    energyRequired := hourlyConsumption * criticalPeak.Duration.Hours()
 
     // Account for round-trip efficiency losses
     energyToStore := energyRequired / dso.config.Battery.RoundTripEfficiency
@@ -456,7 +561,7 @@ func (dso *DynamicSocOptimizer) needsProgressiveCharging(
 
     // Estimate PV contribution during remaining time
     pvEnergyExpected := dso.estimatePvEnergyUntil(deadline)
-    
+
     // Net energy needed from grid after accounting for PV
     gridEnergyNeeded := energyNeeded - pvEnergyExpected
     if gridEnergyNeeded <= 0 {
@@ -538,19 +643,13 @@ func (srm *SocRangeManager) hasBeenOutsideRangeTooLong(currentSoc float64) bool 
     preferredMin := float64(srm.config.SocRange.PreferredMin)
     preferredMax := float64(srm.config.SocRange.PreferredMax)
 
-    // Update time tracking
-    now := time.Now()
+    // Check if currently outside range and time limit exceeded
     if currentSoc < preferredMin || currentSoc > preferredMax {
-        if srm.isFirstTimeOutsideRange() {
-            srm.lastRangeCheckTime = now // Start tracking
-        }
-        srm.timeOutsideRange = now.Sub(srm.lastRangeCheckTime)
-    } else {
-        srm.timeOutsideRange = 0 // Reset when back in range
+        maxDuration := time.Duration(srm.config.SocRange.MaxDurationOutsideRange) * time.Hour
+        return srm.timeOutsideRange > maxDuration
     }
 
-    maxDuration := time.Duration(srm.config.SocRange.MaxDurationOutsideRange) * time.Hour
-    return srm.timeOutsideRange > maxDuration
+    return false // Inside range, no violation
 }
 
 func (srm *SocRangeManager) forceReturnToPreferredRange(
@@ -571,6 +670,32 @@ func (srm *SocRangeManager) forceReturnToPreferredRange(
     }
 
     return targetSoc // Already in range
+}
+
+func (srm *SocRangeManager) isFirstTimeOutsideRange() bool {
+    return srm.timeOutsideRange == 0
+}
+
+// Update range tracking state - should be called on every optimization cycle
+func (srm *SocRangeManager) updateRangeTracking(currentSoc float64) {
+    preferredMin := float64(srm.config.SocRange.PreferredMin)
+    preferredMax := float64(srm.config.SocRange.PreferredMax)
+
+    now := time.Now()
+    if currentSoc < preferredMin || currentSoc > preferredMax {
+        if srm.isFirstTimeOutsideRange() {
+            srm.lastRangeCheckTime = now // Start tracking
+        }
+        srm.timeOutsideRange = now.Sub(srm.lastRangeCheckTime)
+    } else {
+        srm.timeOutsideRange = 0 // Reset when back in range
+        srm.lastRangeCheckTime = time.Time{} // Reset tracking
+    }
+}
+
+// Check if SoC range constraints should override economic optimization
+func (srm *SocRangeManager) shouldForceRangeReturn(currentSoc float64) bool {
+    return srm.hasBeenOutsideRangeTooLong(currentSoc)
 }
 ```
 
@@ -635,8 +760,22 @@ func (site *Site) requiredBatteryMode(batteryGridChargeActive bool, rate api.Rat
             res = extMode
         }
     case site.dynamicBatteryOptimizationActive():
-        // NEW: Dynamic optimization takes priority over legacy grid charge logic
-        res = site.requiredBatteryModeOptimized(rate)
+        // NEW: Dynamic optimization only intervenes for strong recommendations (hold/charge)
+        optimizedMode := site.requiredBatteryModeOptimized(rate)
+        if optimizedMode == api.BatteryHold || optimizedMode == api.BatteryCharge {
+            // Strong recommendation - use optimization decision
+            res = optimizedMode
+        } else {
+            // No strong recommendation - apply existing battery logic manually
+            switch {
+            case batteryGridChargeActive:
+                res = mapper(api.BatteryCharge)
+            case site.dischargeControlActive(rate):
+                res = mapper(api.BatteryHold)
+            case batteryModeModified(batMode):
+                res = api.BatteryNormal
+            }
+        }
     case batteryGridChargeActive:
         res = mapper(api.BatteryCharge)
     case site.dischargeControlActive(rate):
@@ -650,55 +789,550 @@ func (site *Site) requiredBatteryMode(batteryGridChargeActive bool, rate api.Rat
 
 // NEW: Dynamic battery mode determination
 func (site *Site) requiredBatteryModeOptimized(rate api.Rate) api.BatteryMode {
+    // Safety check - ensure optimizer is still available
+    if site.dynamicBatteryOptimizer == nil {
+        site.log.WARN.Println("Dynamic battery optimizer unavailable")
+        return api.BatteryUnknown
+    }
+
     // Emergency charging always takes priority
     emergencyThreshold := float64(site.config.DynamicBatteryOptimization.SocRange.EmergencyMin)
     if site.batterySoc <= emergencyThreshold {
+        site.log.INFO.Printf("Emergency charging activated: SoC %.1f%% <= %.1f%%", site.batterySoc, emergencyThreshold)
         return api.BatteryCharge
     }
 
-    // Get optimization decision
-    pricePattern := site.dynamicBatteryOptimizer.patternAnalyzer.AnalyzePattern(site.rates)
-    decision := site.dynamicBatteryOptimizer.OptimizeBatteryMode(
-        site.batterySoc, pricePattern, site.solarForecast, site.estimatedConsumption,
-    )
+    // Check if optimization recalculation is needed (scheduler-driven)
+    if site.dynamicBatteryOptimizer.ShouldRecalculate(site.batterySoc) {
+        // Safely attempt optimization with error recovery
+        if err := site.performDynamicOptimization(); err != nil {
+            site.log.WARN.Printf("Dynamic optimization failed: %v", err)
+            return api.BatteryUnknown
+        }
+    }
 
-    // Store the target SoC for UI display and status reporting
-    site.dynamicBatteryTargetSoc = decision.TargetSoc
-    site.dynamicBatteryDecision = decision
+    // Use cached decision (either just calculated or from last time)
+    decision := site.dynamicBatteryOptimizer.lastDecision
+
+    // Final validation of cached decision
+    if decision.BatteryMode == api.BatteryUnknown {
+        site.log.WARN.Println("No valid cached optimization decision available")
+        return api.BatteryUnknown
+    }
+
+    // Check if decision has expired
+    if time.Now().After(decision.ValidUntil) {
+        site.log.DEBUG.Println("Cached optimization decision expired, forcing recalculation")
+        // Could trigger immediate recalculation here, but for now return unknown to fall back
+        return api.BatteryUnknown
+    }
+
+    // Log decision details for debugging
+    site.log.DEBUG.Printf("Dynamic optimization: mode=%s target=%.1f%% strategy=%s reason=%s",
+                         decision.BatteryMode.String(), decision.TargetSoc, decision.Strategy, decision.Reasoning)
 
     return decision.BatteryMode
 }
 
 // Check if dynamic optimization should be active
 func (site *Site) dynamicBatteryOptimizationActive() bool {
-    return site.config.DynamicBatteryOptimization.Enable && 
-           site.dynamicBatteryOptimizer != nil &&
-           site.rates != nil // Require rate data for optimization
+    // Feature must be explicitly enabled
+    if !site.config.DynamicBatteryOptimization.Enable {
+        return false
+    }
+
+    // Optimizer must be initialized
+    if site.dynamicBatteryOptimizer == nil {
+        site.log.DEBUG.Println("Dynamic battery optimization disabled: optimizer not initialized")
+        return false
+    }
+
+    // Must have battery configured and accessible
+    if !site.batteryConfigured() {
+        site.log.DEBUG.Println("Dynamic battery optimization disabled: no battery configured")
+        return false
+    }
+
+    // Must have rate data for price-based optimization
+    if site.rates == nil || len(site.rates) == 0 {
+        site.log.DEBUG.Println("Dynamic battery optimization disabled: no tariff rate data available")
+        return false
+    }
+
+    // Must have sufficient rate data (at least 12 hours ahead for meaningful optimization)
+    if !site.hasSufficientRateData() {
+        site.log.DEBUG.Println("Dynamic battery optimization disabled: insufficient rate data for optimization")
+        return false
+    }
+
+    // Battery capacity must be detected for energy calculations
+    if site.batteryCapacity <= 0 {
+        site.log.DEBUG.Println("Dynamic battery optimization disabled: battery capacity not detected")
+        return false
+    }
+
+    // All conditions met - optimization can proceed
+    return true
+}
+
+// Check if we have sufficient rate data for meaningful optimization
+func (site *Site) hasSufficientRateData() bool {
+    if site.rates == nil {
+        return false
+    }
+
+    now := time.Now()
+    futureDataCount := 0
+
+    // Count how many hours of future rate data we have
+    for _, rate := range site.rates {
+        if rate.Start.After(now) {
+            futureDataCount++
+        }
+    }
+
+    // Need at least 12 hours of future data for meaningful peak detection and optimization
+    return futureDataCount >= 12
+}
+
+// Check if dynamic optimization is temporarily disabled due to errors or failures
+func (site *Site) dynamicOptimizationTemporarilyDisabled() bool {
+    // Could be extended to track optimization failures and temporarily disable
+    // For now, always return false (no temporary disabling implemented)
+    return false
+}
+
+// Get reason why dynamic optimization is not active (for debugging/UI display)
+func (site *Site) getDynamicOptimizationDisableReason() string {
+    if !site.config.DynamicBatteryOptimization.Enable {
+        return "Feature disabled in configuration"
+    }
+    if site.dynamicBatteryOptimizer == nil {
+        return "Optimizer not initialized"
+    }
+    if !site.batteryConfigured() {
+        return "No battery configured"
+    }
+    if site.rates == nil || len(site.rates) == 0 {
+        return "No tariff rate data available"
+    }
+    if !site.hasSufficientRateData() {
+        return "Insufficient rate data (need 12+ hours ahead)"
+    }
+    if site.batteryCapacity <= 0 {
+        return "Battery capacity not detected"
+    }
+    if site.dynamicOptimizationTemporarilyDisabled() {
+        return "Temporarily disabled due to errors"
+    }
+    return "Active"
+}
+
+
+// Perform dynamic optimization with comprehensive error handling
+func (site *Site) performDynamicOptimization() error {
+    // Validate prerequisites
+    if site.dynamicBatteryOptimizer == nil {
+        return fmt.Errorf("optimizer not initialized")
+    }
+
+    if site.rates == nil || len(site.rates) == 0 {
+        return fmt.Errorf("no rate data available")
+    }
+
+    if site.batteryCapacity <= 0 {
+        return fmt.Errorf("battery capacity not detected")
+    }
+
+    // Analyze price pattern with error handling
+    pricePattern := site.dynamicBatteryOptimizer.patternAnalyzer.AnalyzePattern(site.rates)
+    if len(pricePattern.Peaks) == 0 && pricePattern.DailyAverage == 0 {
+        return fmt.Errorf("price pattern analysis failed - insufficient data")
+    }
+
+    // Perform optimization
+    decision := site.dynamicBatteryOptimizer.OptimizeBatteryMode(
+        site.batterySoc, pricePattern, site.solarForecast,
+    )
+
+    // Validate decision
+    if decision.BatteryMode == api.BatteryUnknown {
+        return fmt.Errorf("optimization returned unknown battery mode")
+    }
+
+    // Additional validation checks
+    if decision.TargetSoc < 0 || decision.TargetSoc > 100 {
+        return fmt.Errorf("invalid target SoC: %.1f%%", decision.TargetSoc)
+    }
+
+    if decision.ValidUntil.Before(time.Now()) {
+        return fmt.Errorf("optimization returned expired decision")
+    }
+
+    // Store valid decision for UI display and status reporting
+    site.dynamicBatteryTargetSoc = decision.TargetSoc
+    site.dynamicBatteryDecision = decision
+
+    site.log.DEBUG.Printf("Dynamic optimization successful: mode=%s target=%.1f%% strategy=%s",
+                         decision.BatteryMode.String(), decision.TargetSoc, decision.Strategy)
+
+    return nil
+}
+
+// Initialize and configure dynamic battery optimizer during site startup
+func (site *Site) initializeDynamicBatteryOptimizer() error {
+    if !site.config.DynamicBatteryOptimization.Enable {
+        return nil // Feature disabled, skip initialization
+    }
+
+    // TODO: Create and configure optimizer components
+    // site.dynamicBatteryOptimizer = &DynamicSocOptimizer{
+    //     log: site.log,
+    //     config: site.config.DynamicBatteryOptimization,
+    //     capacity: site.batteryCapacity,
+    //     ...
+    // }
+
+    site.log.INFO.Println("Dynamic battery optimization initialized")
+    return nil
+}
+
+// Update optimizer when battery capacity changes or configuration is reloaded
+func (site *Site) updateDynamicBatteryOptimizer() {
+    if !site.config.DynamicBatteryOptimization.Enable {
+        if site.dynamicBatteryOptimizer != nil {
+            site.log.INFO.Println("Dynamic battery optimization disabled - shutting down optimizer")
+            site.dynamicBatteryOptimizer = nil
+        }
+        return
+    }
+
+    if site.dynamicBatteryOptimizer != nil {
+        // Update capacity if it has changed
+        if site.batteryCapacity > 0 && site.dynamicBatteryOptimizer.capacity != site.batteryCapacity {
+            site.log.INFO.Printf("Battery capacity updated: %.1fkWh -> %.1fkWh",
+                                site.dynamicBatteryOptimizer.capacity, site.batteryCapacity)
+            site.dynamicBatteryOptimizer.capacity = site.batteryCapacity
+        }
+
+        // Update configuration if it has changed
+        site.dynamicBatteryOptimizer.config = site.config.DynamicBatteryOptimization
+    } else {
+        // Initialize if not already done
+        if err := site.initializeDynamicBatteryOptimizer(); err != nil {
+            site.log.ERROR.Printf("Failed to initialize dynamic battery optimizer: %v", err)
+        }
+    }
+}
+
+// Handle price data updates to trigger optimization recalculation
+func (site *Site) onTariffPriceUpdate() {
+    if site.dynamicBatteryOptimizer != nil {
+        site.dynamicBatteryOptimizer.OnPriceDataUpdate()
+        site.log.DEBUG.Println("Tariff price data updated - triggering optimization recalculation")
+    }
+}
+
+// Integration with site update cycle - called during site.Update()
+func (site *Site) updateDynamicBatteryOptimization() {
+    // Update optimizer state based on current conditions
+    site.updateDynamicBatteryOptimizer()
+
+    // Update consumption tracking for the estimator
+    if site.dynamicBatteryOptimizer != nil && site.dynamicBatteryOptimizer.consumptionEstimator != nil {
+        // TODO: Update daily consumption tracking
+        // dailyConsumption := site.calculateDailyGridConsumption()
+        // site.dynamicBatteryOptimizer.consumptionEstimator.addDailyConsumption(dailyConsumption)
+    }
+}
+
+// Integration with battery meter updates - called when battery SoC/capacity changes
+func (site *Site) onBatteryUpdate() {
+    // Update battery capacity if it has changed
+    if site.dynamicBatteryOptimizer != nil {
+        if site.batteryCapacity > 0 && site.dynamicBatteryOptimizer.capacity != site.batteryCapacity {
+            site.log.INFO.Printf("Battery capacity detected/updated: %.1fkWh", site.batteryCapacity)
+            site.dynamicBatteryOptimizer.capacity = site.batteryCapacity
+        }
+
+        // Update SoC range manager tracking
+        if site.dynamicBatteryOptimizer.socRangeManager != nil {
+            site.dynamicBatteryOptimizer.socRangeManager.updateRangeTracking(site.batterySoc)
+        }
+    }
+}
+
+// Integration with site configuration loading/reloading
+func (site *Site) onConfigurationUpdate() {
+    // Reinitialize or shutdown optimizer based on new configuration
+    if site.config.DynamicBatteryOptimization.Enable {
+        if site.dynamicBatteryOptimizer == nil {
+            if err := site.initializeDynamicBatteryOptimizer(); err != nil {
+                site.log.ERROR.Printf("Failed to initialize dynamic battery optimizer: %v", err)
+            }
+        } else {
+            // Update configuration for existing optimizer
+            site.dynamicBatteryOptimizer.config = site.config.DynamicBatteryOptimization
+            site.log.INFO.Println("Dynamic battery optimization configuration updated")
+        }
+    } else {
+        if site.dynamicBatteryOptimizer != nil {
+            site.log.INFO.Println("Dynamic battery optimization disabled - shutting down optimizer")
+            site.dynamicBatteryOptimizer = nil
+        }
+    }
+}
+
+// Integration with existing battery publishing - extend to include optimization status
+func (site *Site) publishBatteryOptimizationStatus() {
+    if site.dynamicBatteryOptimizer == nil {
+        return
+    }
+
+    // Publish optimization-specific status
+    status := map[string]interface{}{
+        "enabled":            site.config.DynamicBatteryOptimization.Enable,
+        "active":            site.dynamicBatteryOptimizationActive(),
+        "disableReason":     site.getDynamicOptimizationDisableReason(),
+    }
+
+    if site.dynamicBatteryOptimizer.lastDecision.BatteryMode != api.BatteryUnknown {
+        decision := site.dynamicBatteryOptimizer.lastDecision
+        status["decision"] = map[string]interface{}{
+            "batteryMode":  decision.BatteryMode.String(),
+            "targetSoc":    decision.TargetSoc,
+            "strategy":     decision.Strategy,
+            "reasoning":    decision.Reasoning,
+            "validUntil":   decision.ValidUntil,
+        }
+    }
+
+    // TODO: Publish via existing site publish mechanism
+    // site.publish("batteryOptimization", status)
 }
 ```
 
 **Integration Benefits:**
 - ✅ **Preserves existing behavior** when optimization is disabled
-- ✅ **Respects external battery mode** - external control takes priority  
+- ✅ **Respects external battery mode** - external control takes priority
 - ✅ **Maintains emergency safety** - emergency charging logic preserved
 - ✅ **Inherits coordination** - EV charging, discharge control handled by existing logic
 - ✅ **Single entry point** - all battery decisions flow through `requiredBatteryMode`
 
-##### Emergency Override Integration
+### Complete Site Integration Architecture
+
+#### **Site Lifecycle Integration Points**
+
 ```go
-// Extends core/site_battery.go
-func (site *Site) checkEmergencyCharging() {
-    emergencyThreshold := float64(site.config.DynamicBatteryOptimization.SocRange.EmergencyMin)
+// Site initialization (site.NewSite())
+func (site *Site) initialize() error {
+    // ... existing initialization ...
 
-    if site.batterySoc <= emergencyThreshold {
-        site.log.WARN.Printf("Emergency charging activated: SoC %.1f%% <= %.1f%% threshold",
-                           site.batterySoc, emergencyThreshold)
-
-        // Override any optimization - force emergency charging
-        site.SetBatteryMode(api.BatteryCharge)
-        site.currentBatteryMode = api.BatteryCharge
+    // Initialize dynamic battery optimization after battery meters are configured
+    if err := site.initializeDynamicBatteryOptimizer(); err != nil {
+        site.log.ERROR.Printf("Failed to initialize dynamic battery optimizer: %v", err)
+        // Don't fail site initialization - optimization is optional
     }
+
+    return nil
 }
+
+// Site update cycle (site.Update() - called every 10-30 seconds)
+func (site *Site) Update() {
+    // ... existing update logic ...
+
+    // Update battery capacity and SoC readings
+    site.updateBattery()
+
+    // Update dynamic battery optimization state
+    site.updateDynamicBatteryOptimization()
+
+    // ... rest of update logic ...
+}
+
+// Battery meter update (called when battery data changes)
+func (site *Site) updateBattery() {
+    // ... existing battery update logic ...
+
+    // Notify dynamic optimization of battery changes
+    site.onBatteryUpdate()
+
+    // ... publish battery status including optimization ...
+    site.publishBatteryStatus()
+    site.publishBatteryOptimizationStatus()
+}
+
+// Configuration reload (called when config file changes)
+func (site *Site) updateConfig(config Config) {
+    site.config = config
+
+    // ... existing config update logic ...
+
+    // Update dynamic optimization configuration
+    site.onConfigurationUpdate()
+}
+
+// Tariff rate update (called when new price data arrives)
+func (site *Site) updateTariffRates(rates api.Rates) {
+    site.rates = rates
+
+    // ... existing rate update logic ...
+
+    // Trigger optimization recalculation for new prices
+    site.onTariffPriceUpdate()
+}
+```
+
+#### **Priority and Coordination Logic**
+
+The integration maintains EVCC's existing priority hierarchy with dynamic optimization only intervening for strong recommendations:
+
+```
+1. External Battery Mode (highest priority)
+   ├── Manual user control via API/UI
+   └── Home automation system control
+
+2. Emergency Conditions
+   ├── Emergency SoC thresholds (< 10%)
+   └── System safety overrides
+
+3. Dynamic Battery Optimization (NEW) - ONLY for strong recommendations
+   ├── api.BatteryCharge: During economically beneficial charging periods
+   ├── api.BatteryHold: To preserve energy for upcoming expensive periods
+   └── api.BatteryNormal: Defers to existing logic (no intervention)
+
+4. Legacy Grid Charge Logic
+   ├── Time-based charging schedules
+   └── Simple SoC thresholds
+
+5. Discharge Control
+   ├── Grid feed-in limitations
+   └── Battery protection modes
+
+6. Default Operation
+   └── Normal battery behavior
+```
+
+#### **State Management and Persistence**
+
+```go
+// Site fields to add for dynamic optimization
+type Site struct {
+    // ... existing fields ...
+
+    // Dynamic battery optimization components
+    dynamicBatteryOptimizer *DynamicSocOptimizer
+    dynamicBatteryTargetSoc float64
+    dynamicBatteryDecision  ModeDecision
+
+    // Track optimization performance
+    optimizationMetrics     *OptimizationMetrics
+}
+
+type OptimizationMetrics struct {
+    CostSavingsToday   float64   `json:"costSavingsToday"`
+    CostSavingsWeek    float64   `json:"costSavingsWeek"`
+    PeaksAvoided       int       `json:"peaksAvoided"`
+    SolarOptimization  float64   `json:"solarOptimization"`
+    LastResetTime      time.Time `json:"lastResetTime"`
+}
+```
+
+#### **Error Handling and Monitoring Integration**
+
+```go
+// Add error tracking and monitoring to site
+func (site *Site) trackOptimizationError(err error) {
+    site.log.WARN.Printf("Dynamic battery optimization error: %v", err)
+
+    // Could implement error counting and temporary disabling here
+    // if site.optimizationErrors > threshold {
+    //     site.temporarilyDisableOptimization()
+    // }
+}
+
+// Health check for optimization system
+func (site *Site) isOptimizationHealthy() bool {
+    if site.dynamicBatteryOptimizer == nil {
+        return false
+    }
+
+    // Check if we have recent valid decisions
+    lastDecision := site.dynamicBatteryOptimizer.lastDecision
+    if lastDecision.BatteryMode == api.BatteryUnknown {
+        return false
+    }
+
+    // Check if decision is not too old
+    if time.Since(site.dynamicBatteryOptimizer.lastCalculation) > time.Hour {
+        return false
+    }
+
+    return true
+}
+```
+
+#### **TODO - Implementation Integration Checklist**
+
+**Site Struct Integration:**
+- [ ] Add `dynamicBatteryOptimizer *DynamicSocOptimizer` field to Site struct
+- [ ] Add `dynamicBatteryTargetSoc float64` field for UI display
+- [ ] Add `dynamicBatteryDecision ModeDecision` field for status reporting
+
+**Site Lifecycle Integration:**
+- [ ] Call `initializeDynamicBatteryOptimizer()` in site initialization
+- [ ] Call `updateDynamicBatteryOptimization()` in site update cycle
+- [ ] Call `onBatteryUpdate()` when battery meter data changes
+- [ ] Call `onConfigurationUpdate()` when configuration reloads
+- [ ] Call `onTariffPriceUpdate()` when tariff rates update
+
+**Core Battery Logic Integration:**
+- [ ] Integrate `dynamicBatteryOptimizationActive()` check in `requiredBatteryMode()`
+- [ ] Add `requiredBatteryModeOptimized()` call with fallback logic
+- [ ] Implement `legacyBatteryMode()` fallback function
+
+**Publishing Integration:**
+- [ ] Add `publishBatteryOptimizationStatus()` to battery status publishing
+- [ ] Extend existing battery status with optimization fields
+- [ ] Add optimization-specific publish keys
+
+**Configuration Integration:**
+- [ ] Add `DynamicBatteryOptimization` section to site configuration schema
+- [ ] Implement configuration validation for optimization settings
+- [ ] Handle configuration enable/disable state changes
+
+**Error Handling Integration:**
+- [ ] Add optimization error tracking and logging
+- [ ] Implement graceful degradation strategies
+- [ ] Add health monitoring and recovery mechanisms
+
+#### **Critical Implementation TODOs**
+
+**Configuration Validation (HIGH PRIORITY):**
+```go
+// TODO: Add YAML configuration validation rules
+func validateDynamicBatteryConfig(config DynamicBatteryConfig) error {
+    if config.Optimization.MinSavingsPerKwh <= 0 {
+        return fmt.Errorf("minSavingsPerKwh must be positive, got %.3f", config.Optimization.MinSavingsPerKwh)
+    }
+    if config.SocRange.PreferredMin >= config.SocRange.PreferredMax {
+        return fmt.Errorf("preferredMin (%d) must be less than preferredMax (%d)",
+                         config.SocRange.PreferredMin, config.SocRange.PreferredMax)
+    }
+    if config.Battery.RoundTripEfficiency <= 0.1 || config.Battery.RoundTripEfficiency > 1.0 {
+        return fmt.Errorf("roundTripEfficiency must be 0.1-1.0, got %.3f", config.Battery.RoundTripEfficiency)
+    }
+    return nil
+}
+```
+
+**Solar Forecast Data Structure (MEDIUM PRIORITY):**
+```go
+// TODO: Fix solar forecast rate.Price assumption
+// Current: Assumes rate.Price represents kW generation for solar forecast
+// Issue: Solar forecast may have different data structure than electricity rates
+// Solution: Create separate solar forecast data structure or adapter
+```
 ```
 
 
@@ -767,7 +1401,7 @@ Morning Peak: 07:00-09:00 (€0.45/kWh)
 
 Algorithm Decision:
 - Not in cheap period: €0.28 > daily average ❌
-- In expensive period: €0.28 > €0.30 threshold ✅ 
+- In expensive period: €0.28 > €0.30 threshold ✅
 - But strategic charging not beneficial: (€0.28 ÷ 0.85) + €0.10 = €0.43 effective cost
 - Peak price: €0.45, savings: €0.02 = minimum threshold (marginal) ❌
 - Strategic holding check: currentPrice (€0.28) < peakPrice (€0.45) ✅
@@ -794,9 +1428,11 @@ Required vs possible: 1.25kWh < 20kWh
 Algorithm Decision:
 - Progressive charging needed? 1.25kWh > 20kWh ❌
 - PV will handle most of the gap, no immediate grid charging needed
+- No strong intervention needed - defer to existing battery logic
 
 Battery Mode: api.BatteryNormal
-Reasoning: "PV forecast covers energy gap - no grid charging needed until 17:00"
+Reasoning: "PV forecast covers energy gap - deferring to existing battery logic"
+Site Logic: Existing EVCC logic takes over (grid charge schedules, discharge control, etc.)
 ```
 
 #### Example 6: Progressive Charging Without Sufficient PV
@@ -849,7 +1485,7 @@ site:
 
     # Battery efficiency and physical constraints
     battery:
-      roundTripEfficiency: 0.85    # 85% efficiency (15% loss) - configurable
+      roundTripEfficiency: 0.85    # Combined charge/discharge/AC-DC conversion losses
       wearCostPerKwh: 0.10         # €0.10 wear cost per kWh cycled
 
     # SoC operating range for battery health
@@ -1075,92 +1711,12 @@ GET /api/site/batteryOptimization/targetSoc
    - Unit tests for all optimization algorithms
    - Integration tests with existing EVCC systems
    - Edge case validation (negative prices, pattern failures)
-   - Performance testing with large rate datasets
 
 2. **Documentation & Final Polish**
    - User configuration guide
    - Algorithm explanation documentation
    - UI/UX refinements
-   - Performance optimization
 
-## Testing Strategy
-
-### Unit Tests
-- **Battery Planner**: Algorithm correctness, edge cases
-- **Charging Strategies**: Progressive vs immediate algorithms
-- **Configuration**: YAML parsing, validation
-- **API Endpoints**: CRUD operations, error handling
-
-### Integration Tests
-- **Site Integration**: Coordination with existing EV plans
-- **Tariff Integration**: Rate data consumption
-- **Battery Control**: Mode setting and coordination
-- **WebSocket**: Real-time updates
-
-### Performance Tests
-- **Plan Calculation**: Performance with large rate datasets
-- **Memory Usage**: Long-running plan execution
-- **API Response**: Endpoint response times
-
-### User Acceptance Tests
-- **Configuration Workflow**: Plan creation and editing
-- **Status Monitoring**: Real-time plan progress
-- **Cost Optimization**: Actual vs expected savings
-
-## Risks and Mitigation
-
-### Technical Risks
-1. **Battery Control Conflicts**
-   - *Risk*: Conflicts between manual control, EV plans, and battery plans
-   - *Mitigation*: Clear priority hierarchy and coordination logic
-
-2. **Performance Impact**
-   - *Risk*: Plan calculation affecting system responsiveness
-   - *Mitigation*: Async processing, caching, and optimization
-
-3. **Rate Data Availability**
-   - *Risk*: Tariff provider outages affecting plan generation
-   - *Mitigation*: Fallback strategies and graceful degradation
-
-### User Experience Risks
-1. **Configuration Complexity**
-   - *Risk*: Users finding battery planning too complex
-   - *Mitigation*: Smart defaults, guided setup, and clear documentation
-
-2. **Unexpected Behavior**
-   - *Risk*: Battery charging at unexpected times
-   - *Mitigation*: Clear status indicators and plan preview
-
-## Success Metrics
-
-### Quantitative Metrics
-- **Cost Savings**: Average €/day savings compared to unoptimized battery operation
-- **SoC Health**: Percentage of time spent within preferred SoC range (target: >80%)
-- **Pattern Detection Accuracy**: Percentage of correctly identified price peaks
-- **System Performance**: Optimization decision calculation time <5 seconds
-- **User Adoption**: Percentage of users enabling dynamic optimization
-
-### Qualitative Metrics
-- **Decision Transparency**: User understanding of why optimization made specific choices
-- **Configuration Simplicity**: Success rate of initial setup with minimal configuration
-- **System Reliability**: Uptime and graceful handling of edge cases
-
-## Future Enhancements
-
-### Advanced Algorithms
-- **Machine Learning**: Consumption pattern learning for better predictions
-- **Multi-Objective Optimization**: Balance cost, grid stability, and battery health
-- **Demand Response**: Integration with grid demand response programs
-
-### Extended Integrations
-- **Home Assistant**: Native integration with HA energy dashboard
-- **Vehicle-to-Home**: Coordination with V2H capable vehicles
-- **Grid Services**: Participation in grid stabilization services
-
-### Enhanced UI
-- **Mobile App**: Dedicated mobile interface
-- **Predictive Analytics**: Long-term cost and savings projections
-- **Smart Suggestions**: AI-powered plan recommendations
 
 ## Conclusion
 
@@ -1279,7 +1835,7 @@ The dynamic SoC optimizer generates battery mode decisions based on current SoC 
 | Feature Requirement | Existing Interface | Implementation Strategy |
 |---------------------|-------------------|------------------------|
 | SoC Reading | `Battery.Soc()` | Direct usage for current SoC |
-| Capacity Information | `BatteryCapacity.Capacity()` | Used for energy calculations |
+| Capacity Information | `site.batteryCapacity` | Auto-detected from battery meters via `BatteryCapacity.Capacity()` |
 | Charging Control | `BatteryController.SetBatteryMode()` | Mode-driven SoC targeting |
 | Status Monitoring | Site-level APIs | HTTP endpoints for optimization status |
 | Configuration | YAML site config | Extend existing configuration schema |
