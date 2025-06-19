@@ -289,9 +289,11 @@ func (dso *DynamicSocOptimizer) calculateRequiredBatteryMode(
     if upcomingPeak != nil {
         currentPrice := dso.getCurrentPrice(pattern, currentTime)
         
-        // Strategic charging during moderate prices before expensive peaks
-        if currentSoc < targetSoc && dso.isStrategicChargingBeneficial(currentPrice, upcomingPeak.AvgPrice) {
-            return api.BatteryCharge
+        // Progressive charging check: do we need to charge now to meet target on time?
+        if currentSoc < targetSoc && dso.needsProgressiveCharging(currentSoc, targetSoc, upcomingPeak.Start) {
+            if dso.isStrategicChargingBeneficial(currentPrice, upcomingPeak.AvgPrice) {
+                return api.BatteryCharge
+            }
         }
         
         // Strategic holding: preserve SoC when beneficial for upcoming peaks
@@ -432,6 +434,63 @@ func (dso *DynamicSocOptimizer) isStrategicChargingBeneficial(
     savings := peakPrice - effectiveCost
     return savings > dso.config.Optimization.MinSavingsPerKwh
 }
+
+func (dso *DynamicSocOptimizer) needsProgressiveCharging(
+    currentSoc float64,
+    targetSoc float64,
+    deadline time.Time,
+) bool {
+    timeToDeadline := deadline.Sub(time.Now())
+    if timeToDeadline <= 0 {
+        return true // Past deadline, charge immediately
+    }
+
+    // Calculate how much SoC we need to gain
+    socGapPercent := targetSoc - currentSoc
+    if socGapPercent <= 0 {
+        return false // Already at or above target
+    }
+
+    // Convert SoC gap to energy needed (kWh)
+    energyNeeded := (socGapPercent / 100.0) * dso.capacity
+
+    // Estimate PV contribution during remaining time
+    pvEnergyExpected := dso.estimatePvEnergyUntil(deadline)
+    
+    // Net energy needed from grid after accounting for PV
+    gridEnergyNeeded := energyNeeded - pvEnergyExpected
+    if gridEnergyNeeded <= 0 {
+        return false // PV will cover the gap, no grid charging needed
+    }
+
+    // Calculate maximum possible grid energy with available time
+    maxChargeRate := dso.config.Charging.MaxChargeRateKw
+    hoursAvailable := timeToDeadline.Hours()
+    maxGridEnergyPossible := maxChargeRate * hoursAvailable
+
+    // Need to start charging if we can't meet target with remaining time
+    return gridEnergyNeeded > maxGridEnergyPossible
+}
+
+func (dso *DynamicSocOptimizer) estimatePvEnergyUntil(deadline time.Time) float64 {
+    if dso.solarForecast == nil {
+        return 0 // No solar forecast available
+    }
+
+    totalPvEnergy := 0.0
+    currentTime := time.Now()
+
+    for _, rate := range dso.solarForecast {
+        if rate.Start.After(currentTime) && rate.End.Before(deadline) {
+            // Assume rate.Price represents kW generation for solar forecast
+            duration := rate.End.Sub(rate.Start).Hours()
+            totalPvEnergy += rate.Price * duration
+        }
+    }
+
+    return totalPvEnergy
+}
+
 ```
 
 #### Round-Trip Efficiency Integration
@@ -718,7 +777,49 @@ Battery Mode: api.BatteryHold
 Reasoning: "Preserving SoC for morning peak - current €0.28 < peak €0.45/kWh"
 ```
 
-#### Example 5: Solar-Aware Charging Avoidance
+#### Example 5: Progressive Charging with PV Consideration
+```
+Time: 14:00
+Current SoC: 50%
+Target SoC: 75% (needed by 18:00 for evening peak)
+Time to deadline: 4 hours
+Energy gap: 25% × 15kWh = 3.75kWh needed
+PV forecast: 2.5kWh expected 14:00-17:00
+Net grid energy needed: 3.75 - 2.5 = 1.25kWh
+Max charge rate: 5kW
+Available time: 4 hours
+Max possible grid energy: 5kW × 4h = 20kWh
+Required vs possible: 1.25kWh < 20kWh
+
+Algorithm Decision:
+- Progressive charging needed? 1.25kWh > 20kWh ❌
+- PV will handle most of the gap, no immediate grid charging needed
+
+Battery Mode: api.BatteryNormal
+Reasoning: "PV forecast covers energy gap - no grid charging needed until 17:00"
+```
+
+#### Example 6: Progressive Charging Without Sufficient PV
+```
+Time: 14:00
+Current SoC: 40%
+Target SoC: 80% (needed by 18:00 for evening peak)
+Energy gap: 40% × 15kWh = 6kWh needed
+PV forecast: 1.5kWh expected (cloudy day)
+Net grid energy needed: 6 - 1.5 = 4.5kWh
+Available time: 4 hours
+Max possible grid energy: 5kW × 4h = 20kWh
+Required vs possible: 4.5kWh < 20kWh ✅
+
+Algorithm Decision:
+- Progressive charging needed? Time is adequate, but gap is large
+- Current price €0.25 vs peak €0.45 = economically beneficial
+
+Battery Mode: api.BatteryCharge
+Reasoning: "Progressive charging needed - 4.5kWh gap exceeds PV forecast"
+```
+
+#### Example 7: Solar-Aware Charging Avoidance
 ```
 Time: 02:00
 Current SoC: 40%
