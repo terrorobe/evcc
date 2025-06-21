@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -195,7 +196,12 @@ func (site *Site) Boot(log *util.Logger, loadpoints []*Loadpoint, tariffs *tarif
 	}
 
 	// multiple pv
-	for _, ref := range site.Meters.PVMetersRef {
+	site.log.ERROR.Printf("*** INIT: Boot() - TIMESTAMP: %s - Starting PV meter initialization, PVMetersRef: %v", time.Now().Format("15:04:05.000"), site.Meters.PVMetersRef)
+	site.log.ERROR.Printf("*** INIT: Boot() - TIMESTAMP: %s - pvEnergy map before PV init: %d entries at %p", time.Now().Format("15:04:05.000"), len(site.pvEnergy), site.pvEnergy)
+	
+	for i, ref := range site.Meters.PVMetersRef {
+		site.log.ERROR.Printf("*** INIT: Boot() - Processing PV meter %d: '%s'", i, ref)
+		
 		dev, err := config.Meters().ByName(ref)
 		if err != nil {
 			return err
@@ -203,8 +209,12 @@ func (site *Site) Boot(log *util.Logger, loadpoints []*Loadpoint, tariffs *tarif
 		site.pvMeters = append(site.pvMeters, dev)
 
 		// accumulator
+		site.log.ERROR.Printf("*** INIT: Boot() - Creating pvEnergy['%s'] entry", ref)
 		site.pvEnergy[ref] = &meterEnergy{clock: clock.New()}
+		site.log.ERROR.Printf("*** INIT: Boot() - Created pvEnergy['%s'] at %p", ref, site.pvEnergy[ref])
 	}
+	
+	site.log.ERROR.Printf("*** INIT: Boot() - TIMESTAMP: %s - PV meter initialization complete, pvEnergy map now has %d entries", time.Now().Format("15:04:05.000"), len(site.pvEnergy))
 
 	// multiple batteries
 	for _, ref := range site.Meters.BatteryMetersRef {
@@ -254,6 +264,9 @@ func NewSite() *Site {
 		fcstEnergy: &meterEnergy{clock: clock.New()},
 	}
 
+	site.log.ERROR.Printf("*** INIT: NewSite() - TIMESTAMP: %s - pvEnergy map created at %p with %d entries", time.Now().Format("15:04:05.000"), site.pvEnergy, len(site.pvEnergy))
+	site.log.ERROR.Printf("*** INIT: NewSite() - TIMESTAMP: %s - fcstEnergy created at %p", time.Now().Format("15:04:05.000"), site.fcstEnergy)
+
 	return site
 }
 
@@ -284,6 +297,22 @@ func (site *Site) restoreMetersAndTitle() {
 
 // restoreSettings restores site settings
 func (site *Site) restoreSettings() error {
+	site.log.ERROR.Printf("*** TRACE: restoreSettings() method called - TIMESTAMP: %s", time.Now().Format("15:04:05.000"))
+	site.log.ERROR.Printf("*** CALLSTACK: restoreSettings() called from:\n%s", debug.Stack())
+	
+	// Add panic recovery to catch silent failures
+	defer func() {
+		if r := recover(); r != nil {
+			site.log.ERROR.Printf("*** PANIC RECOVERED in restoreSettings(): %v", r)
+			site.log.ERROR.Printf("*** PANIC STACK TRACE:\n%s", debug.Stack())
+			// Log the state that caused the panic
+			site.log.ERROR.Printf("*** PANIC STATE: pvEnergy map has %d entries", len(site.pvEnergy))
+			for name, entry := range site.pvEnergy {
+				site.log.ERROR.Printf("*** PANIC STATE: pvEnergy['%s'] = %p", name, entry)
+			}
+		}
+	}()
+	
 	if testing.Testing() {
 		return nil
 	}
@@ -318,25 +347,70 @@ func (site *Site) restoreSettings() error {
 	}
 
 	// restore accumulated energy
+	site.log.ERROR.Printf("*** TRACE: Starting energy restoration logic")
+	site.log.ERROR.Printf("*** MEMORY: site pointer: %p", site)
+	site.log.ERROR.Printf("*** MEMORY: site.pvEnergy map pointer: %p", site.pvEnergy)
+	site.log.ERROR.Printf("*** MEMORY: site.pvEnergy map length: %d", len(site.pvEnergy))
+	
 	pvEnergy := make(map[string]float64)
 	fcstEnergy, err := settings.Float(keys.SolarAccForecast)
+	site.log.ERROR.Printf("*** TRACE: settings.Float(SolarAccForecast) = %.6f, err = %v", fcstEnergy, err)
 
-	if err == nil && settings.Json(keys.SolarAccYield, &pvEnergy) == nil {
+	jsonErr := settings.Json(keys.SolarAccYield, &pvEnergy)
+	site.log.ERROR.Printf("*** TRACE: settings.Json(SolarAccYield) = %+v, err = %v", pvEnergy, jsonErr)
+	
+	condition := err == nil && jsonErr == nil
+	site.log.ERROR.Printf("*** TRACE: Condition check (err == nil && jsonErr == nil) = %v", condition)
+
+	if condition {
+		site.log.ERROR.Printf("*** RESTORATION: ENTERING restoration block - THIS IS THE CRITICAL PATH")
+		site.log.ERROR.Printf("*** RESTORATION: site.Meters.PVMetersRef = %v", site.Meters.PVMetersRef)
+		site.log.ERROR.Printf("*** RESTORATION: site.pvEnergy map has %d entries", len(site.pvEnergy))
+		site.log.ERROR.Printf("*** RESTORATION: pvEnergy map address = %p", site.pvEnergy)
+		
 		var nok bool
-		for _, name := range site.Meters.PVMetersRef {
+		for i, name := range site.Meters.PVMetersRef {
+			site.log.DEBUG.Printf("DEBUG: Loop iteration %d: processing meter '%s'", i, name)
+			
 			if fcst, ok := pvEnergy[name]; ok {
+				site.log.ERROR.Printf("*** MEMORY: Found stored value %.6f for meter '%s'", fcst, name)
+				site.log.ERROR.Printf("*** MEMORY: site.pvEnergy map pointer: %p", site.pvEnergy)
+				site.log.ERROR.Printf("*** MEMORY: Looking up site.pvEnergy['%s']...", name)
+				
+				entry := site.pvEnergy[name]
+				site.log.ERROR.Printf("*** MEMORY: site.pvEnergy['%s'] = %p", name, entry)
+				
+				if entry == nil {
+					site.log.ERROR.Printf("*** MEMORY: *** site.pvEnergy['%s'] IS NIL - WILL CAUSE PANIC! ***", name)
+					site.log.ERROR.Printf("*** MEMORY: Map contents dump:")
+					for k, v := range site.pvEnergy {
+						site.log.ERROR.Printf("*** MEMORY:   pvEnergy['%s'] = %p", k, v)
+					}
+					site.log.ERROR.Printf("*** MEMORY: About to access .Accumulated on nil pointer...")
+				} else {
+					site.log.ERROR.Printf("*** MEMORY: site.pvEnergy['%s'] exists at %p, safe to access", name, entry)
+					site.log.ERROR.Printf("*** MEMORY: entry.Accumulated address: %p", &entry.Accumulated)
+				}
+				
+				site.log.ERROR.Printf("*** MEMORY: About to execute: site.pvEnergy['%s'].Accumulated = %.6f", name, fcst)
 				site.pvEnergy[name].Accumulated = fcst
+				site.log.ERROR.Printf("*** MEMORY: Successfully set site.pvEnergy['%s'].Accumulated = %.6f", name, fcst)
 			} else {
 				nok = true
+				site.log.DEBUG.Printf("DEBUG: No stored value found for meter '%s', setting nok=true", name)
 				site.log.WARN.Printf("accumulated solar yield: cannot restore %s", name)
 			}
 		}
 
+		site.log.DEBUG.Printf("DEBUG: Loop completed, nok = %v", nok)
+
 		if !nok {
 			site.fcstEnergy.Accumulated = fcstEnergy
+			site.log.DEBUG.Printf("DEBUG: Restoration SUCCESS - set fcstEnergy.Accumulated = %.6f", fcstEnergy)
 			site.log.DEBUG.Printf("accumulated solar yield: restored %.3fkWh forecasted, %+v produced", fcstEnergy, pvEnergy)
 		} else {
 			// reset metrics
+			site.log.DEBUG.Printf("DEBUG: Restoration FAILED - resetting metrics")
 			site.log.WARN.Printf("accumulated solar yield: metrics reset")
 
 			settings.Delete(keys.SolarAccForecast)
@@ -346,7 +420,14 @@ func (site *Site) restoreSettings() error {
 				pe.Accumulated = 0
 			}
 		}
+	} else {
+		site.log.ERROR.Printf("*** RESTORATION: SKIPPING restoration block - CONDITION FAILED")
+		site.log.ERROR.Printf("*** RESTORATION: err=%v, jsonErr=%v", err, jsonErr)
+		site.log.ERROR.Printf("*** RESTORATION: This means stored data is missing or corrupted")
 	}
+	
+	site.log.ERROR.Printf("*** RESTORATION: Energy restoration logic completed")
+	site.log.ERROR.Printf("*** RESTORATION: Final fcstEnergy.Accumulated = %.6f", site.fcstEnergy.Accumulated)
 
 	return nil
 }
@@ -944,9 +1025,17 @@ func (site *Site) update(lp updater) {
 
 // prepare publishes initial values
 func (site *Site) prepare() {
+	site.log.ERROR.Printf("*** INIT: prepare() - TIMESTAMP: %s - About to call restoreSettings(), pvEnergy map has %d entries", time.Now().Format("15:04:05.000"), len(site.pvEnergy))
+	site.log.ERROR.Printf("*** CALLSTACK: prepare() called from:\n%s", debug.Stack())
+	for name, entry := range site.pvEnergy {
+		site.log.ERROR.Printf("*** INIT: prepare() - pvEnergy['%s'] = %p", name, entry)
+	}
+	
 	if err := site.restoreSettings(); err != nil {
 		site.log.ERROR.Println(err)
 	}
+	
+	site.log.ERROR.Printf("*** INIT: prepare() - restoreSettings() completed")
 
 	site.publish(keys.SiteTitle, site.Title)
 
