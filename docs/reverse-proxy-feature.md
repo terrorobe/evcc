@@ -1,8 +1,8 @@
-# EVCC Remote Access Reverse Proxy
+# evcc Remote Access Reverse Proxy
 
 ### 1. Connection Protocol
-**DECISION**: WebSocket tunnel for EVCC → Proxy, SNI-based TCP forwarding for Mobile → EVCC
-- EVCC opens WebSocket tunnel to proxy (outbound, firewall-friendly)
+**DECISION**: WebSocket tunnel for evcc → Proxy, SNI-based TCP forwarding for Mobile → evcc
+- evcc opens WebSocket tunnel to proxy (outbound, firewall-friendly)
 - Mobile app uses standard HTTPS to subdomain (e.g., abc123.evcc.example)
 - Proxy routes based on SNI in TLS handshake, forwards raw TCP
 - Enables standard HTTP clients while maintaining end-to-end TLS
@@ -15,12 +15,12 @@
 
 ### 2. Encryption Implementation
 **DECISION**: End-to-end TLS with Let's Encrypt via challenge forwarding
-- EVCC instance initiates Let's Encrypt certificate requests for its assigned subdomain
-- Proxy forwards ACME challenges from Let's Encrypt to EVCC via WebSocket tunnel
-- EVCC handles challenge response and receives certificate + private key locally
+- evcc instance initiates Let's Encrypt certificate requests for its assigned subdomain
+- Proxy forwards ACME challenges from Let's Encrypt to evcc via WebSocket tunnel
+- evcc handles challenge response and receives certificate + private key locally
 - Mobile app connects via HTTPS to abc123.evcc.example with trusted Let's Encrypt cert
 - Proxy forwards raw TCP after SNI routing - cannot decrypt traffic
-- All sensitive certificate data remains on EVCC instance
+- All sensitive certificate data remains on evcc instance
 
 ### 3. Sponsor Token Validation
 Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
@@ -35,7 +35,7 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 
 **Runtime state**: Active routing table (subdomain → WebSocket connection)
 
-### 5. EVCC Configuration
+### 5. evcc Configuration
 **NEEDS DEFINITION**: Config structure for proxy settings
 
 ## Technical Components
@@ -48,7 +48,7 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 - Instance registry: `{subdomain, sponsor_token, last_connected}`
 - Connection multiplexer: maps mobile client connections to WebSocket tunnel connection IDs
 
-### EVCC Changes
+### evcc Changes
 - Let's Encrypt certificate management for assigned subdomain (certificates stored in database)
 - HTTPS endpoint support
 - Operational mode requiring authentication for all interface/API requests
@@ -80,36 +80,36 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 ### 1. Initial Instance Enrollment
 
 ```
-1. EVCC opens WebSocket to wss://proxy.evcc.example/register
+1. evcc opens WebSocket to wss://proxy.evcc.example/register
 2. Sends: { "sponsor_token": "abc123", "requested_subdomain": "my-home" }
 3. Proxy validates sponsor token via gRPC to sponsor.evcc.io:8080
 4. Proxy checks subdomain availability and quota
 5. Proxy responds: { "fqdn": "my-home-evcc.evcc.example", "status": "registered" }
 6. Proxy creates temporary routing entry: my-home-evcc.evcc.example → registration WebSocket
 
-7. EVCC starts Let's Encrypt ACME process:
+7. evcc starts Let's Encrypt ACME process:
    a. GET https://acme-v02.api.letsencrypt.org/directory to get endpoint URLs
    b. POST /acme/new-account with termsOfServiceAgreed: true
    c. POST /acme/new-order with identifiers: [{"type": "dns", "value": "my-home-evcc.evcc.example"}]
    d. Receive order with authorization URL for the domain
 
-7. EVCC fetches authorization object:
+7. evcc fetches authorization object:
    a. POST-as-GET to authorization URL
    b. Receives challenges including HTTP-01 challenge with token
 
-8. EVCC sends challenge response:
+8. evcc sends challenge response:
    a. POST to challenge URL with empty payload: "{}"
    b. Let's Encrypt validation server makes HTTP request to:
       GET https://my-home-evcc.evcc.example/.well-known/acme-challenge/<token>
 
-9. Proxy receives ACME challenge HTTP request for my-home-evcc.evcc.example and forwards to EVCC via the active registration WebSocket:
+9. Proxy receives ACME challenge HTTP request for my-home-evcc.evcc.example and forwards to evcc via the active registration WebSocket:
    {
      "type": "acme_challenge",
      "request_id": "req_12345",
      "token": "LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"
    }
 
-10. EVCC responds with key authorization via WebSocket:
+10. evcc responds with key authorization via WebSocket:
     {
       "type": "acme_response",
       "request_id": "req_12345",
@@ -120,13 +120,13 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 
 12. Let's Encrypt validates response and marks authorization as "valid"
 
-13. EVCC finalizes order:
+13. evcc finalizes order:
     a. POST CSR to order's finalize URL
     b. Let's Encrypt issues certificate
-    c. EVCC downloads certificate via POST-as-GET to certificate URL
-    d. EVCC stores certificate and private key in database
+    c. evcc downloads certificate via POST-as-GET to certificate URL
+    d. evcc stores certificate and private key in database
 
-14. EVCC closes registration WebSocket (enrollment complete)
+14. evcc closes registration WebSocket (enrollment complete)
 
 15. Proxy removes temporary routing entry when WebSocket closes
 
@@ -136,7 +136,7 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 ### 2. Instance Reconnection
 
 ```
-1. EVCC opens WebSocket to wss://proxy.evcc.example/connect with client certificate
+1. evcc opens WebSocket to wss://proxy.evcc.example/connect with client certificate
 2. Uses its Let's Encrypt certificate for my-home-evcc.evcc.example as client cert
 3. Proxy validates certificate and extracts subdomain from cert (my-home-evcc.evcc.example → my-home-evcc)
 4. Proxy creates permanent routing table entry and updates last_connected timestamp
@@ -146,14 +146,14 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 ### 3. Mobile Client Enrollment
 
 ```
-1. User accesses EVCC web UI via local network
+1. User accesses evcc web UI via local network
 2. User logs in with admin password
 3. User generates QR code for mobile app (protected by auth middleware)
-4. EVCC generates JWT token with long expiry (e.g., 90 days)
+4. evcc generates JWT token with long expiry (e.g., 90 days)
 5. QR code contains: { "endpoint": "https://my-home-evcc.evcc.example", "token": "jwt-token-xyz" }
 6. Mobile app scans QR code, validates SSL certificate (Let's Encrypt)
 7. Mobile app makes test API call with Authorization: Bearer jwt-token-xyz
-8. EVCC validates JWT token using standard auth middleware
+8. evcc validates JWT token using standard auth middleware
 9. Mobile app stores endpoint and token for future requests
 ```
 
@@ -163,13 +163,13 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 1. API client makes HTTPS request to https://my-home-evcc.evcc.example/api/state
 2. Request includes: Authorization: Bearer jwt-token-xyz
 3. Proxy routes via SNI to correct WebSocket tunnel (raw TCP forwarding)
-4. EVCC receives request, ensureAuthHandler middleware validates JWT token
-5. EVCC processes request, returns response
+4. evcc receives request, ensureAuthHandler middleware validates JWT token
+5. evcc processes request, returns response
 ```
 
 ### 5. Request Authentication
 
-**Current EVCC Authentication System:**
+**Current evcc Authentication System:**
 - **Admin Web UI**: JWT tokens in HTTP-only cookies (`auth` cookie name)
 - **API Clients**: JWT tokens in `Authorization: Bearer <token>` header
 - **Auth Middleware**: `ensureAuthHandler` validates JWT tokens for protected routes
@@ -177,6 +177,6 @@ Sponsor token validation via gRPC to `sponsor.evcc.io:8080`
 
 **Proxy Authentication Handling:**
 - Proxy routes raw TCP based on SNI - cannot see or modify HTTP content
-- EVCC handles all authentication exactly as it does today
+- evcc handles all authentication exactly as it does today
 - JWT tokens work unchanged through the tunnel
 - No proxy modifications needed to authentication system
