@@ -968,6 +968,11 @@
         "label": "Optimization"
       },
       "planNumber": "Plan {number}",
+      "power": {
+        "label": "Charging power",
+        "max": "maximum",
+        "required": "required average"
+      },
       "precondition": {
         "description": "Charge {duration} before departure for battery preconditioning.",
         "label": "Late Charging",

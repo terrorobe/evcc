@@ -33,7 +33,10 @@ export interface StaticEnergyPlan {
   time: Date;
 }
 
+export type PlanPowerMode = "max" | "required";
+
 export interface PlanStrategy {
   continuous: boolean;
   precondition: number;
+  power?: PlanPowerMode;
 }

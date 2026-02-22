@@ -1368,6 +1368,12 @@ components:
           description: "Precondition duration in seconds"
           type: integer
           minimum: 0
+        power:
+          description: "Plan execution power strategy"
+          type: string
+          enum:
+            - max
+            - required
     RepeatingPlan:
       externalDocs:
         url: https://docs.evcc.io/en/docs/features/plans#repeating-plans

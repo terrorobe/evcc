@@ -157,14 +157,27 @@ func (v *adapter) GetRepeatingPlans() []api.RepeatingPlan {
 }
 
 func (v *adapter) GetPlanStrategy() api.PlanStrategy {
-	var strategy api.PlanStrategy
+	strategy := api.PlanStrategy{Power: api.PlanPowerMax}
 	if err := settings.Json(v.key()+keys.PlanStrategy, &strategy); err != nil {
-		return api.PlanStrategy{}
+		return strategy
+	}
+	if strategy.Power != api.PlanPowerRequired {
+		strategy.Power = api.PlanPowerMax
+	}
+	if strategy.Precondition < 0 {
+		strategy.Precondition = 0
 	}
 	return strategy
 }
 
 func (v *adapter) SetPlanStrategy(planStrategy api.PlanStrategy) error {
+	if planStrategy.Power != api.PlanPowerRequired {
+		planStrategy.Power = api.PlanPowerMax
+	}
+	if planStrategy.Precondition < 0 {
+		planStrategy.Precondition = 0
+	}
+
 	if err := settings.SetJson(v.key()+keys.PlanStrategy, planStrategy); err != nil {
 		return err
 	}

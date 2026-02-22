@@ -968,6 +968,11 @@
         "label": "Optimierung"
       },
       "planNumber": "Plan {number}",
+      "power": {
+        "label": "Ladeleistung",
+        "max": "maximal",
+        "required": "notwendiger Durchschnitt"
+      },
       "precondition": {
         "description": "Lade {duration} vor Abfahrt zur Batterie-Vorkonditionierung.",
         "label": "Spätes Laden",

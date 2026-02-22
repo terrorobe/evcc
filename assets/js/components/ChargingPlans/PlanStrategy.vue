@@ -1,14 +1,14 @@
 <template>
 	<div class="collapsible-wrapper" :class="{ open: show }">
 		<div class="collapsible-content pb-3">
-			<div v-if="disabled" class="row mb-4">
+			<div v-if="optimizationDisabled" class="row mb-4">
 				<div class="small text-muted">
 					<strong class="text-primary">{{ $t("general.note") }}</strong>
 					{{ $t("main.chargingPlan.strategyDisabledDescription") }}
 				</div>
 			</div>
-			<div v-else class="row">
-				<div class="col-12 col-sm-6 col-lg-3 offset-lg-3 mb-3">
+			<div class="row">
+				<div class="col-12 col-sm-6 col-lg-4 mb-3">
 					<div class="row">
 						<label :for="formId('continuous')" class="col-form-label col-5 col-sm-12">
 							{{ $t("main.chargingPlan.optimization.label") }}
@@ -18,6 +18,7 @@
 								:id="formId('continuous')"
 								v-model="localContinuous"
 								class="form-select"
+								:disabled="optimizationDisabled"
 								@change="updateStrategy"
 							>
 								<option :value="false">
@@ -30,7 +31,7 @@
 						</div>
 					</div>
 				</div>
-				<div class="col-sm-6 col-lg-3 mb-3">
+				<div class="col-sm-6 col-lg-4 mb-3">
 					<div class="row">
 						<label :for="formId('precondition')" class="col-form-label col-5 col-sm-12">
 							{{ $t("main.chargingPlan.precondition.label") }}
@@ -40,6 +41,7 @@
 								:id="formId('precondition')"
 								v-model="localPrecondition"
 								class="form-select"
+								:disabled="optimizationDisabled"
 								@change="updateStrategy"
 							>
 								<option :value="0">
@@ -56,6 +58,28 @@
 						</div>
 					</div>
 				</div>
+				<div class="col-sm-6 col-lg-4 mb-3">
+					<div class="row">
+						<label :for="formId('power')" class="col-form-label col-5 col-sm-12">
+							{{ $t("main.chargingPlan.power.label") }}
+						</label>
+						<div class="col-7 col-sm-12">
+							<select
+								:id="formId('power')"
+								v-model="localPower"
+								class="form-select"
+								@change="updateStrategy"
+							>
+								<option value="max">
+									{{ $t("main.chargingPlan.power.max") }}
+								</option>
+								<option value="required">
+									{{ $t("main.chargingPlan.power.required") }}
+								</option>
+							</select>
+						</div>
+					</div>
+				</div>
 			</div>
 		</div>
 	</div>
@@ -64,7 +88,7 @@
 <script lang="ts">
 import { defineComponent } from "vue";
 import formatter from "@/mixins/formatter";
-import type { PlanStrategy } from "./types";
+import type { PlanPowerMode, PlanStrategy } from "./types";
 
 export default defineComponent({
 	name: "ChargingPlanStrategy",
@@ -74,13 +98,15 @@ export default defineComponent({
 		show: Boolean,
 		precondition: { type: Number, default: 0 },
 		continuous: { type: Boolean, default: false },
-		disabled: Boolean,
+		power: { type: String as () => PlanPowerMode, default: "max" },
+		optimizationDisabled: Boolean,
 	},
 	emits: ["update"],
 	data() {
 		return {
 			localPrecondition: this.precondition,
 			localContinuous: this.continuous,
+			localPower: this.power,
 		};
 	},
 	computed: {
@@ -127,6 +153,14 @@ export default defineComponent({
 			},
 			immediate: true,
 		},
+		power: {
+			handler(newValue: PlanPowerMode) {
+				if (newValue !== this.localPower) {
+					this.localPower = newValue;
+				}
+			},
+			immediate: true,
+		},
 	},
 	methods: {
 		formId(name: string) {
@@ -136,6 +170,7 @@ export default defineComponent({
 			const strategy: PlanStrategy = {
 				continuous: this.localContinuous,
 				precondition: this.localPrecondition,
+				power: this.localPower,
 			};
 			this.$emit("update", strategy);
 		},

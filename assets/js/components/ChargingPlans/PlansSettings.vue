@@ -59,7 +59,8 @@
 			:id="id"
 			:precondition="effectivePlanStrategy?.precondition"
 			:continuous="effectivePlanStrategy?.continuous"
-			:disabled="strategyDisabled"
+			:power="effectivePlanStrategy?.power"
+			:optimization-disabled="strategyDisabled"
 			:show="strategyOpen"
 			@update="updatePlanStrategy"
 		/>

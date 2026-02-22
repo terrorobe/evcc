@@ -293,8 +293,9 @@ func NewLoadpoint(log *util.Logger, settings settings.Settings) *Loadpoint {
 		bus:               bus,      // event bus
 		mode:              api.ModeOff,
 		status:            api.StatusNone,
-		minCurrent:        6,   // A
-		maxCurrent:        16,  // A
+		minCurrent:        6,  // A
+		maxCurrent:        16, // A
+		planStrategy:      api.PlanStrategy{Power: api.PlanPowerMax},
 		batteryBoostLimit: 100, // disabled
 		Soc: loadpoint.SocConfig{
 			Poll: loadpoint.PollConfig{
@@ -1298,6 +1299,61 @@ func (lp *Loadpoint) fastCharging() error {
 	return lp.setLimit(lp.effectiveMaxCurrent())
 }
 
+// planCharging scales current according to plan strategy
+func (lp *Loadpoint) planCharging() error {
+	strategy := lp.EffectivePlanStrategy()
+	if strategy.Power != api.PlanPowerRequired {
+		return lp.fastCharging()
+	}
+
+	planTime := lp.EffectivePlanTime()
+	if planTime.IsZero() {
+		return lp.fastCharging()
+	}
+
+	remainingDuration := lp.clock.Until(planTime)
+	if remainingDuration <= 0 {
+		return lp.fastCharging()
+	}
+
+	goal, _ := lp.GetPlanGoal()
+	maxPower := lp.EffectiveMaxPower()
+	requiredDuration := lp.GetPlanRequiredDuration(goal, maxPower)
+	if requiredDuration <= 0 {
+		return lp.fastCharging()
+	}
+
+	if lp.hasPhaseSwitching() {
+		phases := 3
+		maxPower1p := Voltage * lp.effectiveMaxCurrent()
+
+		// load management limit active
+		if circuitMaxPower := circuitMaxPower(lp.circuit); circuitMaxPower > 0 && circuitMaxPower < 1.1*maxPower1p {
+			phases = 1
+			lp.log.DEBUG.Printf("plan charging: scaled to 1p to match %.0fW max circuit power", circuitMaxPower)
+		}
+
+		if err := lp.scalePhasesIfAvailable(phases); err != nil {
+			return err
+		}
+	}
+
+	targetPower := maxPower * float64(requiredDuration) / float64(remainingDuration)
+	activePhases := lp.ActivePhases()
+	targetCurrent := powerToCurrent(targetPower, activePhases)
+	targetCurrent = max(lp.effectiveMinCurrent(), min(lp.effectiveMaxCurrent(), targetCurrent))
+
+	lp.log.DEBUG.Printf("plan charging: %.3gA (required %v of %v, %.0fW @ %dp)",
+		targetCurrent,
+		requiredDuration.Round(time.Second),
+		remainingDuration.Round(time.Second),
+		currentToPower(targetCurrent, activePhases),
+		activePhases,
+	)
+
+	return lp.setLimit(targetCurrent)
+}
+
 // pvScalePhases switches phases if necessary and returns number of phases switched to
 func (lp *Loadpoint) pvScalePhases(sitePower, minCurrent, maxCurrent float64) int {
 	phases := lp.GetPhases()
@@ -1994,9 +2050,15 @@ func (lp *Loadpoint) Update(sitePower, batteryBoostPower float64, consumption, f
 		}
 		err = lp.setLimit(current)
 
-	// minimum or target charging
-	case lp.minSocNotReached() || plannerActive:
+	// minimum charging
+	case lp.minSocNotReached():
 		err = lp.fastCharging()
+		lp.resetPhaseTimer()
+		lp.elapsePVTimer() // let PV mode disable immediately afterwards
+
+	// target charging
+	case plannerActive:
+		err = lp.planCharging()
 		lp.resetPhaseTimer()
 		lp.elapsePVTimer() // let PV mode disable immediately afterwards
 
