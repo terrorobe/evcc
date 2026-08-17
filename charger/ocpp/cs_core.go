@@ -46,10 +46,13 @@ func (cs *CS) OnDataTransfer(id string, request *core.DataTransferRequest) (*cor
 }
 
 func (cs *CS) OnHeartbeat(id string, request *core.HeartbeatRequest) (*core.HeartbeatConfirmation, error) {
-	// no cp handler
+	currentTime := types.Now()
+	if cp, err := cs.ChargepointByID(id); err == nil {
+		currentTime = cp.dateTime()
+	}
 
 	res := &core.HeartbeatConfirmation{
-		CurrentTime: types.Now(),
+		CurrentTime: currentTime,
 	}
 
 	return res, nil

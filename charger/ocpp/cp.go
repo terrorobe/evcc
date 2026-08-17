@@ -32,6 +32,7 @@ type CP struct {
 	PhaseSwitching          bool
 	HasRemoteTriggerFeature bool
 	ChargingRateUnit        types.ChargingRateUnitType
+	DateTimeFormat          string
 	ChargingProfileId       int
 	StackLevel              int
 	NumberOfConnectors      int
@@ -105,6 +106,10 @@ func (cp *CP) ID() string {
 	defer cp.mu.RUnlock()
 
 	return cp.id
+}
+
+func (cp *CP) dateTime() *types.DateTime {
+	return types.NewDateTimeWithFormat(time.Now(), cp.DateTimeFormat)
 }
 
 func (cp *CP) RegisterID(id string) {

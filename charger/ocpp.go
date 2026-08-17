@@ -64,6 +64,7 @@ func NewOCPPFromConfig(ctx context.Context, other map[string]any) (api.Charger, 
 		Connector      int
 		MeterInterval  time.Duration
 		MeterValues    string
+		DateTimeFormat string
 		ConnectTimeout time.Duration // Initial Timeout
 
 		Timeout          time.Duration              // TODO deprecated
@@ -94,7 +95,7 @@ func NewOCPPFromConfig(ctx context.Context, other map[string]any) (api.Charger, 
 
 	c, err := NewOCPP(ctx,
 		cc.StationId, cc.Connector, cc.IdTag,
-		cc.MeterValues, cc.MeterInterval,
+		cc.MeterValues, cc.MeterInterval, cc.DateTimeFormat,
 		cc.ForcePowerCtrl, stackLevelZero, profileKindRelative, cc.RemoteStart, noChangeAvailability,
 		cc.ConnectTimeout)
 	if err != nil {
@@ -135,7 +136,7 @@ func NewOCPPFromConfig(ctx context.Context, other map[string]any) (api.Charger, 
 // NewOCPP creates OCPP charger
 func NewOCPP(ctx context.Context,
 	id string, connector int, idTag string,
-	meterValues string, meterInterval time.Duration,
+	meterValues string, meterInterval time.Duration, dateTimeFormat string,
 	forcePowerCtrl, stackLevelZero, profileKindRelative, remoteStart, noChangeAvailability bool,
 	connectTimeout time.Duration,
 ) (*OCPP, error) {
@@ -148,7 +149,9 @@ func NewOCPP(ctx context.Context,
 
 	cp, err := cs.RegisterChargepoint(id,
 		func() *ocpp.CP {
-			return ocpp.NewChargePoint(log, cs, id)
+			cp := ocpp.NewChargePoint(log, cs, id)
+			cp.DateTimeFormat = dateTimeFormat
+			return cp
 		},
 		func(cp *ocpp.CP) error {
 			log.DEBUG.Printf("waiting for chargepoint: %v", connectTimeout)
@@ -350,7 +353,7 @@ func (c *OCPP) createTxDefaultChargingProfile(current float64) *types.ChargingPr
 		res.ChargingProfileKind = types.ChargingProfileKindRelative
 	} else {
 		res.ChargingProfileKind = types.ChargingProfileKindAbsolute
-		res.ChargingSchedule.StartSchedule = types.NewDateTime(time.Now().Add(-time.Minute))
+		res.ChargingSchedule.StartSchedule = types.NewDateTimeWithFormat(time.Now().Add(-time.Minute), c.cp.DateTimeFormat)
 	}
 
 	if !c.stackLevelZero {

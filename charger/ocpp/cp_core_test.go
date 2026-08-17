@@ -41,6 +41,22 @@ func TestBootNotificationStoresResultAndConnects(t *testing.T) {
 	}
 }
 
+func TestBootNotificationDateTimeFormat(t *testing.T) {
+	log := util.NewLogger("test")
+	request := &core.BootNotificationRequest{}
+
+	customCP := NewChargePoint(log, instance, "custom")
+	customCP.DateTimeFormat = "2006-01-02T15:04:05.000Z07:00"
+	customResponse, err := customCP.OnBootNotification(request)
+	require.NoError(t, err)
+	assert.Regexp(t, `T\d{2}:\d{2}:\d{2}\.\d{3}Z$`, customResponse.CurrentTime.FormatTimestamp())
+
+	defaultCP := NewChargePoint(log, instance, "default")
+	defaultResponse, err := defaultCP.OnBootNotification(request)
+	require.NoError(t, err)
+	assert.NotContains(t, defaultResponse.CurrentTime.FormatTimestamp(), ".")
+}
+
 func TestBootNotificationStopsTimer(t *testing.T) {
 	log := util.NewLogger("test")
 	cp := NewChargePoint(log, instance, "test-cp")
